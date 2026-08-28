@@ -1,0 +1,76 @@
+classDiagram
+    class Market {
+        +spot: float
+        +rate: float
+        +dividend: float
+        +fx(spot, rd, rf) Market
+        +forward(T) float
+        +log_forward(T) float
+    }
+
+    class CubicSpline1D {
+        -x, y, m: array
+        +__call__(xq) float|array
+    }
+
+    class ImpliedVolSurface {
+        +k_nodes, expiries, vols
+        +w_nodes: array
+        +calendar_violations: int
+        +single_expiry: bool
+        +from_csv(path) ImpliedVolSurface
+        +total_variance(k, T) float|array
+        +implied_vol(k, T) float|array
+    }
+
+    class DupireLocalVol {
+        +surface: ImpliedVolSurface
+        +floor_count: int
+        +cap_count: int
+        +vol(k, T) float|array
+        +local_variance(k, T) float|array
+        +reset_counters()
+    }
+
+    class tridiag {
+        <<module>>
+        +thomas_solve(sub, diag, sup, rhs) array
+    }
+
+    class black_scholes {
+        <<module>>
+        +bs_price(S, K, r, q, sigma, T, call) float
+        +bs_delta() float
+        +bs_gamma() float
+        +bs_vega() float
+        +implied_vol(price, ...) float
+    }
+
+    class pde {
+        <<module>>
+        +price_european_pde(market, K, T, vol, ...) float
+        +price_american_put_pde(market, K, T, vol, ...) float
+    }
+
+    class mc {
+        <<module>>
+        +price_european_mc(market, K, T, vol, ...) MCResult
+        +price_up_out_call_mc(market, K, B, T, vol, ...) MCResult
+    }
+
+    class MCResult {
+        +price: float
+        +stderr: float
+        +within(reference, n_se) bool
+    }
+
+    ImpliedVolSurface "1" o-- "n" CubicSpline1D : one per expiry
+    ImpliedVolSurface ..> tridiag : spline moments
+    DupireLocalVol --> ImpliedVolSurface : differentiates w(k,T)
+    pde ..> tridiag : theta-scheme solves
+    pde ..> Market : forward, discounting
+    pde ..> black_scholes : sigma=0 short-circuit
+    mc ..> Market : drift, discounting
+    pde ..> DupireLocalVol : sigma(k,t) lookup
+    mc ..> DupireLocalVol : sigma(k,t) lookup
+    mc ..> MCResult : returns

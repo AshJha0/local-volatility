@@ -1,0 +1,3 @@
+numpy>=1.24
+scipy>=1.10   # tests only: banded-solve cross-check; never in the pricer path
+pytest>=7.0

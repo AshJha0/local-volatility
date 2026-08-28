@@ -1,0 +1,20 @@
+sequenceDiagram
+    participant P as price_european_pde
+    participant G as grid builder
+    participant D as DupireLocalVol
+    participant T as thomas_solve
+
+    P->>P: validate inputs, analytic short-circuits (T=0, sigma=0, K=0)
+    P->>G: build x_i = ln S0 + (i - M/2) h, W = |ln K/S0| + nsd·sigma_ref·sqrt(T) + |r-q|T
+    G-->>P: x grid (ln S0 = node M/2), payoff V = max(phi(e^x - K), 0)
+
+    loop Rannacher schedule: 2 x BE(dt/2), then N-1 x CN(dt)
+        P->>D: vol(x_i - ln F(t_mid), t_mid) at step midpoint
+        D-->>P: sigma_i per interior node (clamped, counted)
+        P->>P: assemble tridiagonal theta-system, fold Dirichlet boundaries into rhs
+        P->>T: solve (I - theta·dts·L) V_new = rhs
+        T-->>P: interior V_new (or PSOR sweeps for American put)
+        P->>P: set boundary nodes to discounted asymptotics at new tau
+    end
+
+    P-->>P: price = V[M/2] (no interpolation)
