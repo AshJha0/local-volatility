@@ -1,4 +1,4 @@
-# localvol — Dupire Local Volatility (Surface, PDE, Monte Carlo)
+# Dupire Local Volatility (Surface, PDE, Monte Carlo)
 
 A four-language reference implementation of the full local-volatility pricing
 pipeline: an implied-volatility surface in total-variance form, Dupire local
