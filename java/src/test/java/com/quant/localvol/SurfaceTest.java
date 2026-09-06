@@ -149,4 +149,89 @@ public class SurfaceTest {
         assertThrows(IllegalArgumentException.class, () -> s.totalVariance(Double.NaN, 1.0));
         assertThrows(IllegalArgumentException.class, () -> s.totalVariance(0.0, -1.0));
     }
+
+    private static java.nio.file.Path writeTempCsv(String name, String body) throws java.io.IOException {
+        java.nio.file.Path p = java.nio.file.Files.createTempFile("localvol_" + name, ".csv");
+        p.toFile().deleteOnExit();
+        java.nio.file.Files.writeString(p, body);
+        return p;
+    }
+
+    private static final String BASE_CSV =
+            "T,k,iv\n0.5,-0.1,0.22\n0.5,0.0,0.2\n0.5,0.1,0.21\n1.0,-0.1,0.23\n1.0,0.0,0.21\n1.0,0.1,0.22\n";
+
+    @Test
+    public void csvRejectsDuplicateMissingAndShortRows() throws java.io.IOException {
+        // MIN-4 / MIN-5: duplicates and gaps are named; short/extra/non-numeric
+        // rows are IllegalArgumentException, never ArrayIndexOutOfBounds.
+        ImpliedVolSurface good = ImpliedVolSurface.fromCsv(writeTempCsv("good", BASE_CSV));
+        assertEquals(2, good.numExpiries());
+        assertEquals(3, good.numKNodes());
+        IllegalArgumentException dup = assertThrows(IllegalArgumentException.class,
+                () -> ImpliedVolSurface.fromCsv(writeTempCsv("dup", BASE_CSV + "1.0,0.0,0.25\n")));
+        assertTrue(dup.getMessage(), dup.getMessage().contains("duplicate"));
+        String missing = BASE_CSV.substring(0, BASE_CSV.lastIndexOf("1.0,0.1"));
+        IllegalArgumentException gap = assertThrows(IllegalArgumentException.class,
+                () -> ImpliedVolSurface.fromCsv(writeTempCsv("missing", missing)));
+        assertTrue(gap.getMessage(), gap.getMessage().contains("rectangular"));
+        String[][] bad = {
+                {"short", "T,k,iv\n0.5,-0.1,0.22\n0.5,0.0\n"},
+                {"extra", "T,k,iv,x\n0.5,-0.1,0.22,1\n"},
+                {"long", "T,k,iv\n0.5,-0.1,0.22,1\n"},
+                {"nonnum", "T,k,iv\n0.5,-0.1,abc\n"},
+                {"nonfinite", "T,k,iv\n0.5,-0.1,NaN\n"},
+                {"empty", "T,k,iv\n"},
+                {"negiv", "T,k,iv\n0.5,0.0,-0.2\n"},
+        };
+        for (String[] c : bad) {
+            java.nio.file.Path p = writeTempCsv(c[0], c[1]);
+            assertThrows(c[0], IllegalArgumentException.class, () -> ImpliedVolSurface.fromCsv(p));
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> ImpliedVolSurface.fromCsv(Paths.get("..", "data", "does_not_exist.csv")));
+        // Blank lines, spaces and CRLF endings are tolerated.
+        StringBuilder crlf = new StringBuilder("T,k,iv\r\n");
+        for (String line : BASE_CSV.split("\n")) {
+            if (!line.startsWith("T,")) {
+                crlf.append(" ").append(line).append(" \r\n");
+            }
+        }
+        crlf.append("\r\n");
+        assertEquals(3, ImpliedVolSurface.fromCsv(writeTempCsv("crlf", crlf.toString())).numKNodes());
+    }
+
+    @Test
+    public void negativeTotalVarianceOvershootIsCounted() {
+        // MIN-15: a ragged slice whose spline dips to w <= 0 between nodes is
+        // reported via negativeWCount(); clean surfaces report 0.
+        ImpliedVolSurface clean = ImpliedVolSurface.fromCsv(Paths.get("..", "data", "implied_surface.csv"));
+        assertEquals(0, clean.negativeWCount());
+        double[] ks = {-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3};
+        double[] row = {1.0, 0.001, 0.001, 1.0, 0.001, 0.001, 1.0};
+        ImpliedVolSurface ragged = new ImpliedVolSurface(ks, new double[]{0.5, 1.0}, new double[][]{row, row});
+        assertTrue(ragged.negativeWCount() > 0);
+        double minW = 1.0;
+        double minIv = 1.0;
+        for (int i = 0; i <= 600; i++) {
+            double k = -0.3 + 0.001 * i;
+            minW = Math.min(minW, ragged.totalVariance(k, 1.0));
+            minIv = Math.min(minIv, ragged.impliedVol(k, 1.0));
+        }
+        assertTrue(minW < 0.0);
+        assertEquals(0.0, minIv, 0.0); // reads 0% there rather than throwing
+    }
+
+    @Test
+    public void marketLogForwardValidationAndValue() {
+        // MIN-6: logForward validates expiry in every port.
+        Market mkt = new Market(100.0, 0.03, 0.01);
+        assertEquals(Math.log(100.0) + 0.02 * 2.0, mkt.logForward(2.0), 1e-15);
+        assertEquals(Math.log(100.0), mkt.logForward(0.0), 0.0);
+        assertThrows(IllegalArgumentException.class, () -> mkt.logForward(-1.0));
+        assertThrows(IllegalArgumentException.class, () -> mkt.logForward(Double.NaN));
+        assertThrows(IllegalArgumentException.class, () -> mkt.forward(Double.POSITIVE_INFINITY));
+        assertThrows(IllegalArgumentException.class, () -> new Market(100.0, Double.NaN, 0.0));
+        assertThrows(IllegalArgumentException.class, () -> new Market(100.0, 0.0, Double.POSITIVE_INFINITY));
+        assertThrows(IllegalArgumentException.class, () -> new Market(0.0, 0.0, 0.0));
+    }
 }

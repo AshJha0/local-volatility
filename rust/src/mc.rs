@@ -32,9 +32,13 @@
 //!   deterministic per seed) and strictly lowers the price versus discrete
 //!   monitoring.
 //!
-//! The RNG is `StdRng` seeded from a fixed `u64`; per the cross-language
-//! contract each language uses its own generator, so MC golden comparisons
-//! are statistical (tolerances sized at 4 standard errors).
+//! The RNG is `rand::rngs::StdRng` (ChaCha12 in `rand` 0.8) seeded from a
+//! fixed `u64`, with `rand_distr::StandardNormal` (ziggurat).  `StdRng` is
+//! documented as *not* stable across `rand` releases, so runs are
+//! deterministic for a fixed toolchain / lockfile only; per the
+//! cross-language contract each language uses its own generator and MC
+//! golden comparisons are statistical (tolerances sized at 4 standard
+//! errors).
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -63,9 +67,10 @@ impl McResult {
 /// Simulation settings shared by the MC pricers.
 #[derive(Debug, Clone, Copy)]
 pub struct McSettings {
-    /// Total number of paths (even when `antithetic`).
+    /// Total number of paths: `>= 4` and even when `antithetic`, else `>= 2`
+    /// (a standard error needs at least two samples / pair means).
     pub n_paths: usize,
-    /// Number of time steps.
+    /// Number of time steps (`>= 1`).
     pub n_steps: usize,
     /// RNG seed (fixed -> deterministic estimate).
     pub seed: u64,
@@ -91,11 +96,22 @@ fn validate_mc(strike: f64, expiry: f64, vol: &VolInput, s: &McSettings) -> Resu
     if !expiry.is_finite() || expiry <= 0.0 {
         return Err(invalid(format!("expiry must be finite and > 0, got {expiry}")));
     }
-    if s.n_paths < 2 {
-        return Err(invalid(format!("n_paths must be >= 2, got {}", s.n_paths)));
-    }
-    if s.antithetic && s.n_paths % 2 != 0 {
-        return Err(invalid("antithetic sampling requires an even n_paths"));
+    if s.antithetic {
+        if s.n_paths % 2 != 0 {
+            return Err(invalid("antithetic sampling requires an even n_paths"));
+        }
+        if s.n_paths < 4 {
+            return Err(invalid(format!(
+                "n_paths must be >= 4 with antithetic sampling (at least two pair means are \
+                 needed for a standard error), got {}",
+                s.n_paths
+            )));
+        }
+    } else if s.n_paths < 2 {
+        return Err(invalid(format!(
+            "n_paths must be >= 2 (at least two samples are needed for a standard error), got {}",
+            s.n_paths
+        )));
     }
     if s.n_steps < 1 {
         return Err(invalid(format!("n_steps must be >= 1, got {}", s.n_steps)));
@@ -147,7 +163,7 @@ pub fn price_european_mc(
     let mut z = vec![0.0_f64; n_base];
     for n in 0..settings.n_steps {
         let t = n as f64 * dt;
-        let lf = market.log_forward(t);
+        let lf = market.log_forward(t)?;
         for zi in z.iter_mut() {
             *zi = rng.sample(StandardNormal);
         }
@@ -208,14 +224,15 @@ pub fn price_up_out_call_mc(
         let mut weight = vec![1.0_f64; n_base];
         for (n, z) in z_all.iter().enumerate() {
             let t = n as f64 * dt;
-            let lf = market.log_forward(t);
+            let lf = market.log_forward(t)?;
             for i in 0..n_base {
                 let sig = vol.sigma(x[i] - lf, t)?;
                 let x_new = x[i] + drift_rq - 0.5 * sig * sig * dt + sign * sig * sq * z[i];
                 if x_new >= b {
                     weight[i] = 0.0;
                 } else if brownian_bridge && weight[i] > 0.0 {
-                    // P[bridge from x to x_new crosses b], both below b.
+                    // P[bridge from x to x_new crosses b], both below b
+                    // (sig == 0 gives exp(-inf) = 0: no crossing possible).
                     let p = (-2.0 * (b - x[i]) * (b - x_new) / (sig * sig * dt)).exp();
                     weight[i] *= 1.0 - p;
                 }

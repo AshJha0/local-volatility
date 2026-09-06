@@ -10,7 +10,7 @@ import java.nio.file.Paths;
  * European vanillas by PDE (and spot-check by Monte Carlo) → invert back to
  * implied vols → report the error against the input surface in basis points.
  *
- * <p>Run: {@code ./demo.sh} (optionally pass the data directory, default
+ * <p>Run: {@code bash demo.sh} (optionally pass the data directory, default
  * {@code ../data} relative to the working directory).
  */
 public final class Demo {
@@ -52,8 +52,8 @@ public final class Demo {
         double maxErrBp = 0.0;
         double maxAtK = 0.0;
         double maxAtT = 0.0;
+        lv.resetCounters(); // once: the clamp report below covers the whole sweep
         for (double t : expiries) {
-            lv.resetCounters();
             StringBuilder row = new StringBuilder(String.format("  %-5.2f", t));
             double sigmaRef = surface.impliedVol(0.0, t);
             for (double strike : strikes) {

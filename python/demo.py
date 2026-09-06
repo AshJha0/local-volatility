@@ -51,8 +51,8 @@ def main() -> int:
     print("  T\\K   " + "".join(f"{k:>8.0f}" for k in strikes))
     max_err_bp = 0.0
     max_at = (0.0, 0.0)
+    lv.reset_counters()  # once: the clamp report below covers the whole sweep
     for t in expiries:
-        lv.reset_counters()
         row = [f"  {t:<5.2f}"]
         sigma_ref = float(surface.implied_vol(0.0, t))
         for strike in strikes:

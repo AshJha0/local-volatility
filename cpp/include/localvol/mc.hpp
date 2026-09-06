@@ -43,14 +43,17 @@ struct McResult {
     bool within(double reference, double n_se = 3.0) const;
 };
 
-/// Simulation parameters. The RNG is std::mt19937_64 + a Box-Muller-free
-/// std::normal_distribution; MC golden comparisons are statistical (the
-/// tolerances were sized at 4 SE), so each language fixes its own seed.
+/// Simulation parameters. The RNG is std::mt19937_64 driving
+/// std::normal_distribution<double>. The normal transform is
+/// implementation-defined (libstdc++, libc++ and MSVC produce different
+/// streams for the same seed), so runs are deterministic for a fixed
+/// toolchain only; MC golden comparisons are statistical (tolerances sized
+/// at 4 SE) and each language fixes its own seed.
 struct McSettings {
-    int n_paths = 20000;      ///< total paths (even when antithetic).
-    int n_steps = 100;        ///< Euler steps.
+    int n_paths = 20000;      ///< total paths: >= 4 and even when antithetic, else >= 2.
+    int n_steps = 100;        ///< Euler steps (>= 1).
     std::uint64_t seed = 42;  ///< fixed seed — deterministic runs.
-    bool antithetic = true;   ///< +Z/-Z pairing (requires even n_paths).
+    bool antithetic = true;   ///< +Z/-Z pairing (requires even n_paths >= 4).
 };
 
 /// European vanilla by log-Euler MC under a flat volatility (> 0).
@@ -59,7 +62,10 @@ McResult price_european_mc(const Market& market, double strike, double expiry,
                            double sigma, bool is_call = true,
                            const McSettings& settings = McSettings{});
 
-/// European vanilla by log-Euler MC under a sigma(k, t) callable.
+/// European vanilla by log-Euler MC under a sigma(k, t) callable. The
+/// callable's output is checked on every lookup: NaN, inf or a negative
+/// sigma throws std::invalid_argument instead of propagating into the
+/// estimate (sigma == 0 is allowed: a deterministic step).
 McResult price_european_mc(const Market& market, double strike, double expiry,
                            const VolFn& vol, bool is_call = true,
                            const McSettings& settings = McSettings{});

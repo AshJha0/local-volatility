@@ -10,7 +10,8 @@ sequenceDiagram
 
     loop Rannacher schedule: 2 x BE(dt/2), then N-1 x CN(dt)
         P->>D: vol(x_i - ln F(t_mid), t_mid) at step midpoint
-        D-->>P: sigma_i per interior node (clamped, counted)
+        D-->>P: sigma_i per interior node (clamped, counted, output checked finite and non-negative)
+        P->>P: coefficients: central where |mu_i| h <= 2 a_i, upwind elsewhere
         P->>P: assemble tridiagonal theta-system, fold Dirichlet boundaries into rhs
         P->>T: solve (I - theta·dts·L) V_new = rhs
         T-->>P: interior V_new (or PSOR sweeps for American put)

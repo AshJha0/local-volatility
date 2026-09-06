@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>local-volatility — Dupire local volatility surface, PDE and Monte Carlo in four languages</title>
+<!-- GitHub Pages landing page. If the repository is renamed, update the
+     github.com/AshJha0/local-volatility links below to match. -->
+<style>
+:root{--teal:#16697a;--green:#16a085;--ink:#1a1a2e;--muted:#556}
+body{font-family:'Segoe UI',Arial,sans-serif;margin:0;color:var(--ink);background:#f7f8fa}
+header{background:var(--teal);color:#fff;padding:3rem 2rem}
+header h1{margin:0 0 .5rem;font-size:2.2rem}
+header p{margin:0;max-width:52rem;opacity:.92;line-height:1.5}
+.wrap{max-width:64rem;margin:0 auto;padding:0 2rem}
+nav{margin-top:1.2rem}
+nav a{display:inline-block;background:var(--green);color:#fff;text-decoration:none;
+  padding:.55rem 1.1rem;margin:.25rem .6rem .25rem 0;border-radius:4px;font-weight:600}
+nav a.secondary{background:rgba(255,255,255,.15)}
+h2{color:var(--teal);border-bottom:2px solid #e3e8ec;padding-bottom:.3rem;margin-top:2.5rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(17rem,1fr));gap:1rem;margin:1.2rem 0}
+.card{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.12);padding:1rem 1.2rem;border-radius:4px}
+.card h3{margin:.1rem 0 .5rem;font-size:1.02rem;color:var(--teal)}
+.card p{margin:0;font-size:.9rem;color:var(--muted);line-height:1.45}
+pre{background:#10222a;color:#d7e3ea;padding:1rem 1.2rem;border-radius:4px;overflow-x:auto;
+  font-size:.85rem;line-height:1.5}
+.numbers{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.12);border-radius:4px;
+  padding:1rem 1.4rem;font-family:Consolas,monospace;font-size:.88rem;line-height:1.7}
+.numbers table{border-collapse:collapse}
+.numbers td{padding:.05rem 1.2rem .05rem 0;vertical-align:top}
+.numbers td:first-child{color:var(--teal);white-space:nowrap}
+.honest{background:#fff8ec;border-left:4px solid var(--green);padding:.8rem 1.2rem;
+  border-radius:4px;font-size:.92rem;line-height:1.55;margin:1.2rem 0}
+footer{margin:3rem 0 2rem;color:var(--muted);font-size:.85rem;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>local-volatility</h1>
+    <p>A four-language reference implementation (Python normative, C++, Rust, Java) of the full local-volatility pricing pipeline: an implied-volatility surface in total-variance form, Dupire local volatility in Gatheral's formula, a Crank-Nicolson/Rannacher finite-difference pricer with a PSOR American-put variant, and a log-Euler Monte Carlo engine with a Brownian-bridge barrier correction. Every port is held to the same 15 golden cases and to a round-trip check — SSVI surface → Dupire → PDE → implied vol — that recovers the surface to 2.73 bp with zero clamps; API_SPEC.md pins the spline, Thomas solver, wing clamp, Rannacher schedule and upwind rule so deterministic engines match to tight absolute tolerances.</p>
+    <nav>
+      <a href="https://github.com/AshJha0/local-volatility/blob/main/LEARN.md">Learn (guide)</a>
+      <a class="secondary" href="https://github.com/AshJha0/local-volatility/blob/main/COOKBOOK.md">Cookbook</a>
+      <a class="secondary" href="https://github.com/AshJha0/local-volatility/blob/main/docs/ARCHITECTURE.md">Architecture</a>
+      <a class="secondary" href="https://github.com/AshJha0/local-volatility/blob/main/API_SPEC.md">API contract</a>
+      <a class="secondary" href="https://github.com/AshJha0/local-volatility#references">References</a>
+      <a class="secondary" href="https://github.com/AshJha0/local-volatility">GitHub</a>
+      <a class="secondary" href="https://ashjha0.github.io/quant-portfolio/">Quant portfolio</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <h2>Measured, not claimed</h2>
+  <div class="numbers"><table>
+    <tr><td>Cross-language parity</td><td>python 90 · cpp 72 · rust 73 · java 70 tests — 305 green</td></tr>
+    <tr><td>Golden suite</td><td>15 named cases in <code>golden.json</code> covering every engine (flat Dupire, flat PDE, bundled Dupire, local-vol PDE, American put, MC, barrier); absolute tolerance per case</td></tr>
+    <tr><td>Round trip</td><td>SSVI surface → Dupire → PDE 200×200 → implied vol: max interior error 2.73 bp at K = 80, T = 2 (spec target 30 bp, tests assert &lt; 5 bp), 0 floor and 0 cap clamps on the 4 × 7 sweep — identical in all four ports</td></tr>
+    <tr><td>Deterministic tolerances</td><td>flat-surface Dupire identity 0.20 to 1e-6 · bundled Dupire vols 1e-4 abs · local-vol PDE 1e-3 rel · flat-vol PDE vs Black-Scholes 1e-3 rel · American put vs CRR-5000 within 1e-2</td></tr>
+    <tr><td>Statistical tolerances</td><td>MC and barrier goldens sized at 4 standard errors (barrier + a residual-bias allowance); each language uses its own fixed-seed generator, agreement is within SE, not bit-exact</td></tr>
+    <tr><td>Pinned numerics</td><td>Dupire FD steps DK = 1e-3, DT = 1e-4 with the stencil clamped inside the quoted box · clamp range [1%, 500%] · Rannacher two backward-Euler half-steps · first-order upwind where |mu| h &gt; 2a · PSOR omega = 1.5, tol = 1e-8</td></tr>
+    <tr><td>Convergence checks</td><td>observed PDE order in [1.5, 2.5] flat and [0.8, 2.5] local vol · non-oscillatory gamma · T = 0 local vol continuous with T → 0+ (Berestycki-Busca-Florent limit)</td></tr>
+    <tr><td>Measured performance</td><td>200×200 European PDE: 0.7 ms flat, ~5 ms local vol in C++ (Python ~50 / ~115 ms); 20k × 100 local-vol MC ~0.26 s natively — 2-core review box, nothing tuned for throughput</td></tr>
+  </table></div>
+
+  <div class="honest"><strong>What the latest review found and fixed.</strong> The Dupire finite-difference stencil was allowed to straddle the flat-wing kink of the implied surface, which produced 500 % local vols <em>at the last quoted strike</em> and a round-trip implied-vol error of 16.4 bp, about 85 % of it caused by those spikes. The stencil is now clamped to <code>[k_min + DK, k_max − DK]</code>; the round-trip error fell to 2.73 bp with zero clamps, so on a smooth input surface any non-zero clamp counter now means genuine arbitrage. The same review defined <code>vol(k, 0)</code> as the Berestycki-Busca-Florent short-time limit instead of an undefined division, added first-order upwinding at Péclet-violating nodes (M-matrix preserved), checked user vol callables for NaN/negative output, made the CSV loader strict, moved pillar goldens 1e-3 off the pillars and regenerated <code>golden.json</code>; all three native ports were re-pinned. Not verified: behaviour on real, noisy market quotes — the bundled surface is a smooth SSVI sample.</div>
+
+  <h2>What's inside</h2>
+  <div class="grid">
+    <div class="card"><h3>Implied-volatility surface</h3>
+      <p><code>ImpliedVolSurface</code> stores total variance <code>w(k, T)</code> on forward log-moneyness: a natural cubic spline per expiry, linear total variance in T, flat wings, flat-forward-variance below the first pillar and floored-slope linear extrapolation beyond the last. A calendar-arbitrage node check and a spline-overshoot (<code>w ≤ 0</code>) scan run at build time; violations are counted and warned, never repaired or raised.</p></div>
+    <div class="card"><h3>Dupire local volatility</h3>
+      <p>Gatheral's total-variance form of the Dupire formula with fixed-step central finite differences (DK = 1e-3, DT = 1e-4), the stencil clamped inside the quoted strike box, T = 0 defined as the Berestycki-Busca-Florent short-time limit, and output clamped to [1 %, 500 %] with thread-safe floor/cap counters (atomics in C++/Rust, LongAdder in Java) so one <code>DupireLocalVol</code> can be shared across threads.</p></div>
+    <div class="card"><h3>Finite-difference pricer</h3>
+      <p>Log-spot theta scheme: Crank-Nicolson with a Rannacher start of two backward-Euler half-steps, a native Thomas tridiagonal solver, Dirichlet boundaries from discounted asymptotics, the price read at the exact spot node, and a first-order upwind fallback at any node violating the mesh Péclet condition. American puts use projected SOR on the same systems (omega = 1.5, tol = 1e-8, warm-started); non-convergence warns, never throws.</p></div>
+    <div class="card"><h3>Monte Carlo &amp; barriers</h3>
+      <p>Log-Euler with start-of-step local-vol lookup, antithetic pairs with a pair-mean standard error, fixed seeds per language (NumPy PCG64, <code>std::mt19937_64</code>, Rust <code>StdRng</code>, Java <code>L64X128MixRandom</code>), and user vol callables checked for finite non-negative output. Up-and-out calls use discrete monitoring plus optional Brownian-bridge survival weights that remove the O(√dt) monitoring bias.</p></div>
+    <div class="card"><h3>Black-Scholes / Garman-Kohlhagen</h3>
+      <p>Price, delta, gamma, vega and a bisection implied-vol inverter (100 halvings on [1e-9, 5]) that rejects prices outside the static no-arbitrage bounds. Equity <code>(r, q)</code> and FX <code>(rd, rf)</code> share every formula through one <code>Market</code> type; the surface is carry-free and the pricers reintroduce carry.</p></div>
+    <div class="card"><h3>Golden suite &amp; generator</h3>
+      <p><code>data/golden/golden.json</code> holds 15 cases; each language dispatches on the case-name prefix and asserts <code>|got − expect| ≤ tol</code>. References are exact identities (flat Dupire = 0.20), closed forms (Black-Scholes, Reiner-Rubinstein barrier), CRR-5000 binomial for the American put, and the Python reference for local-vol cases. <code>generate_data.py</code> validates against Black-Scholes, the flat-surface identity and a no-clamp sweep before writing.</p></div>
+    <div class="card"><h3>Validation &amp; error contract</h3>
+      <p>NaN/inf/negative/empty/unsorted/duplicate inputs are rejected at every public entry point with the idiomatic error (<code>ValueError</code>, <code>std::invalid_argument</code>, <code>Err(LocalVolError)</code>, <code>IllegalArgumentException</code>); bounds such as <code>num_space</code> even and ≥ 4, <code>omega ∈ (0, 2)</code>, <code>n_paths ≥ 4</code> with antithetics are pinned. Reported rather than raised: calendar arbitrage, spline overshoot, Dupire clamps, PSOR non-convergence, single-expiry surfaces.</p></div>
+    <div class="card"><h3>Units, scope, limits</h3>
+      <p>Spot is a price or FX rate, rates are continuously compounded, T is a bare year fraction — no day count, calendar, settlement lag or date type. Continuous yield only; single flat r and q per call; European calls/puts, American puts and continuously-monitored up-and-out calls; no calibration, the surface is taken as given. Local vol is discontinuous in T at each pillar, the PDE grid is uniform, and Greeks at the kink retain an O(dt) component from the two-half-step Rannacher start.</p></div>
+    <div class="card"><h3>References</h3>
+      <p>Dupire (1994); Derman &amp; Kani (1994); Gatheral (2006) eq. 1.10; Berestycki, Busca &amp; Florent (2002); Gatheral &amp; Jacquier (2014) SSVI; Gyöngy (1986); Rannacher (1984) and Giles &amp; Carter (2006); Tavella &amp; Randall (2000); Cryer (1971) and Wilmott, Dewynne &amp; Howison (1993) for PSOR; Cox, Ross &amp; Rubinstein (1979); Reiner &amp; Rubinstein (1991) / Haug (2007); Glasserman (2004); Beaglehole, Dybvig &amp; Zhou (1997); Garman &amp; Kohlhagen (1983); de Boor (1978); Abramowitz &amp; Stegun §7.1.14; Hagan et al. (2002).</p></div>
+    <div class="card"><h3>Guide &amp; cookbook</h3>
+      <p>LEARN.md covers the three kinds of volatility, the Dupire derivation and its total-variance form with a worked ATM example tied to a golden case, the short-expiry limit, surface construction and arbitrage, the theta scheme and Rannacher smoothing, PSOR, local-vol MC and the Brownian bridge, where local vol breaks, pitfalls, a desk workflow and interview Q&amp;A. COOKBOOK.md's C++/Rust/Java snippets are written against the real APIs and compile-checked, including a thread-sharing recipe.</p></div>
+  </div>
+
+  <h2>Part of a wider portfolio</h2>
+  <div class="grid">
+    <div class="card"><h3><a href="https://ashjha0.github.io/quant-portfolio/" style="color:inherit">quant-portfolio</a></h3>
+      <p>The end-to-end quantitative finance portfolio this project sits alongside: 10 project
+         areas built twice each (equity + FX) in Python with C++ and Rust performance twins —
+         31 sub-projects with golden-vector cross-language validation, a 481-question learning
+         guide and a verified cookbook. <a href="https://github.com/AshJha0/quant-portfolio">GitHub&nbsp;→</a></p></div>
+    <div class="card"><h3><a href="https://ashjha0.github.io/intraday-alpha-platform/" style="color:inherit">intraday-alpha-platform</a></h3>
+      <p>A polyglot (Python/C++/Rust/Java) research-to-production intraday trading platform:
+         market data → order books → 205-feature factory → 24 alphas → validation → portfolio →
+         fail-closed risk → execution → TCA, with an adaptive drift/lifecycle layer and 1,160
+         golden-parity tests. <a href="https://github.com/AshJha0/intraday-alpha-platform">GitHub&nbsp;→</a></p></div>
+    <div class="card"><h3><a href="https://github.com/AshJha0/Quant-Finance-Library" style="color:inherit">quantfinlib</a></h3>
+      <p>A zero-dependency quantitative finance platform for the JVM — research, validation,
+         execution and connectivity, from walk-forward backtesting to a measured
+         sub-microsecond tick-to-order path, with 1,090+ tests and CI on every push.
+         <a href="https://github.com/AshJha0/Quant-Finance-Library">GitHub&nbsp;→</a></p></div>
+  </div>
+
+  <h2>Quick start</h2>
+<pre>git clone https://github.com/AshJha0/local-volatility &amp;&amp; cd local-volatility
+
+# Python reference (3.11, numpy &gt;= 1.24, pytest)
+cd python
+PYTHONPATH=src python3 -m pytest -q    # test suite (incl. golden cases): 90 passed
+PYTHONPATH=src python3 demo.py         # round-trip demo
+cd ..
+
+# C++ (C++17, CMake &gt;= 3.16, GoogleTest, g++ 13)
+cd cpp
+bash build.sh    # cmake -S . -B build -DCMAKE_BUILD_TYPE=Release &amp;&amp; cmake --build build -j2
+ctest --test-dir build --output-on-failure   # 72 tests
+./build/demo
+cd ..
+
+# Rust (edition 2021)
+cd rust
+cargo build --release      # zero warnings
+cargo test --release       # 73 tests
+cargo run --release --bin demo
+cd ..
+
+# Java (21, JUnit 4 — no Maven/Gradle)
+cd java
+bash build.sh    # javac -Xlint:all everything into out/ (zero warnings)
+bash test.sh     # JUnitCore on all *Test classes: 70 tests
+bash demo.sh     # runs the demo main (data dir defaults to ../data)</pre>
+
+  <footer>local-volatility — four golden-pinned ports of the Dupire pipeline, validated by a 2.73 bp round trip and honest about what it does not cover. See the <a href="https://github.com/AshJha0/local-volatility/blob/main/README.md">README</a> and the <a href="https://github.com/AshJha0/local-volatility/blob/main/LICENSE">MIT license</a>.</footer>
+</div>
+</body>
+</html>

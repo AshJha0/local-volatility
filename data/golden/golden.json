@@ -77,35 +77,35 @@
       "tol": 0.009553756225
     },
     {
-      "name": "dupire_bundled_k80_T05",
+      "name": "dupire_bundled_k80_T0501",
       "inputs": {
         "k": -0.223143551314,
-        "T": 0.5
+        "T": 0.501
       },
       "expect": {
-        "local_vol": 0.2984578802
+        "local_vol": 0.2913439835
       },
       "tol": 0.0001
     },
     {
-      "name": "dupire_bundled_k95_T1",
+      "name": "dupire_bundled_k95_T1001",
       "inputs": {
         "k": -0.051293294388,
-        "T": 1.0
+        "T": 1.001
       },
       "expect": {
-        "local_vol": 0.2100352256
+        "local_vol": 0.2091962672
       },
       "tol": 0.0001
     },
     {
-      "name": "dupire_bundled_k100_T1",
+      "name": "dupire_bundled_k100_T1001",
       "inputs": {
         "k": 0.0,
-        "T": 1.0
+        "T": 1.001
       },
       "expect": {
-        "local_vol": 0.1944181803
+        "local_vol": 0.1944178773
       },
       "tol": 0.0001
     },
@@ -144,9 +144,9 @@
         "sigma_ref": 0.2
       },
       "expect": {
-        "price": 7.9609093235
+        "price": 7.9615846335
       },
-      "tol": 0.007960909324
+      "tol": 0.007961584633
     },
     {
       "name": "american_put_flat_crr5000",
@@ -194,9 +194,9 @@
         "n_steps": 100
       },
       "expect": {
-        "price": 7.9609093235
+        "price": 7.9615846335
       },
-      "tol": 0.243241
+      "tol": 0.233524
     },
     {
       "name": "barrier_upout_flat_bb",

@@ -1,5 +1,6 @@
 #include "localvol/black_scholes.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 #include <stdexcept>
@@ -89,6 +90,10 @@ double implied_vol(double price, double spot, double strike, double rate, double
     if (!std::isfinite(price)) throw std::invalid_argument("implied_vol: price must be finite");
     if (expiry <= 0.0) throw std::invalid_argument("implied_vol requires expiry > 0");
     if (strike <= 0.0) throw std::invalid_argument("implied_vol requires strike > 0");
+    if (!(std::isfinite(lo) && std::isfinite(hi) && 0.0 < lo && lo < hi)) {
+        throw std::invalid_argument("implied_vol: bracket must satisfy 0 < lo < hi");
+    }
+    if (iterations < 1) throw std::invalid_argument("implied_vol: iterations must be >= 1");
     // Static no-arbitrage bounds: sigma=0 price below, discounted asset /
     // strike above (with tiny slack for round-off).
     const double lower = bs_price(spot, strike, rate, dividend, 0.0, expiry, is_call);

@@ -53,8 +53,8 @@ int main() {
     std::printf("\n");
     double max_err_bp = 0.0;
     double max_at_k = 0.0, max_at_t = 0.0;
+    lv.reset_counters();  // once: the clamp report below covers the whole sweep
     for (double t : expiries) {
-        lv.reset_counters();
         std::printf("  %-5.2f", t);
         const double sigma_ref = surface.implied_vol(0.0, t);
         for (double strike : strikes) {

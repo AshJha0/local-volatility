@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -59,6 +60,10 @@ ResolvedVol resolve_fn(const VolFn& vol, double expiry, std::optional<double> si
     rv.fn = &vol;
     // Default reference vol: the ATM local vol at expiry.
     rv.sigma_ref = sigma_ref.has_value() ? *sigma_ref : vol(0.0, expiry);
+    if (!sigma_ref.has_value() && (!std::isfinite(rv.sigma_ref) || rv.sigma_ref < 0.0)) {
+        throw std::invalid_argument("pde: vol callable returned non-finite/negative sigma at t=" +
+                                    std::to_string(expiry));
+    }
     if (!std::isfinite(rv.sigma_ref) || rv.sigma_ref <= 0.0) {
         throw std::invalid_argument("pde: sigma_ref must be finite and > 0");
     }
@@ -99,6 +104,11 @@ struct StepCoeffs {
     std::vector<double> lower, center, upper;  // size M-1 (interior nodes)
 };
 
+/// Central differences for the drift wherever the mesh Peclet condition
+/// |mu_i| h <= 2 a_i holds; first-order upwind at nodes where it fails
+/// (floored local vol with strong carry) so both off-diagonals stay >= 0
+/// and the theta-scheme matrix keeps its M-matrix / monotonicity property.
+/// Both branches have row sum -r.
 StepCoeffs step_coeffs(const std::vector<double>& sigma_nodes, double r, double q, double h) {
     const std::size_t n = sigma_nodes.size();
     StepCoeffs c;
@@ -109,10 +119,16 @@ StepCoeffs step_coeffs(const std::vector<double>& sigma_nodes, double r, double 
         const double a = 0.5 * sigma_nodes[i] * sigma_nodes[i];  // diffusion
         const double mu = (r - q) - a;                           // log-spot drift
         const double alpha = a / (h * h);
-        const double beta = mu / (2.0 * h);
-        c.lower[i] = alpha - beta;   // coefficient of V_{i-1}
-        c.upper[i] = alpha + beta;   // coefficient of V_{i+1}
-        c.center[i] = -2.0 * alpha - r;  // coefficient of V_i
+        if (std::abs(mu) * h <= 2.0 * a) {
+            const double beta = mu / (2.0 * h);
+            c.lower[i] = alpha - beta;       // coefficient of V_{i-1}
+            c.upper[i] = alpha + beta;       // coefficient of V_{i+1}
+            c.center[i] = -2.0 * alpha - r;  // coefficient of V_i
+        } else {
+            c.lower[i] = alpha + std::max(-mu, 0.0) / h;
+            c.upper[i] = alpha + std::max(mu, 0.0) / h;
+            c.center[i] = -2.0 * alpha - std::abs(mu) / h - r;
+        }
     }
     return c;
 }
@@ -216,7 +232,17 @@ std::vector<double> sigma_at_nodes(const ResolvedVol& rv, const Market& market,
         std::fill(sig.begin(), sig.end(), rv.sigma);
     } else {
         const double lf = market.log_forward(t_mid);
-        for (std::size_t i = 0; i < n; ++i) sig[i] = (*rv.fn)(x[i + 1] - lf, t_mid);
+        for (std::size_t i = 0; i < n; ++i) {
+            sig[i] = (*rv.fn)(x[i + 1] - lf, t_mid);
+            // Reject NaN/inf/negative output eagerly: a bad coefficient would
+            // otherwise surface as an opaque Thomas-solver error or, for a
+            // negative sigma, silently enter the scheme squared.
+            if (!std::isfinite(sig[i]) || sig[i] < 0.0) {
+                throw std::invalid_argument(
+                    "pde: vol callable returned non-finite/negative sigma at t=" +
+                    std::to_string(t_mid));
+            }
+        }
     }
     return sig;
 }
@@ -285,8 +311,9 @@ void validate_psor(const PsorSettings& psor) {
     if (!(psor.omega > 0.0 && psor.omega < 2.0)) {
         throw std::invalid_argument("pde: omega must lie in (0, 2)");
     }
-    if (!(psor.tol > 0.0) || psor.max_iter < 1) {
-        throw std::invalid_argument("pde: tol must be > 0 and max_iter >= 1");
+    // `!(tol > 0)` also rejects NaN, which `tol <= 0` would let through.
+    if (!(std::isfinite(psor.tol) && psor.tol > 0.0) || psor.max_iter < 1) {
+        throw std::invalid_argument("pde: tol must be finite and > 0 and max_iter >= 1");
     }
 }
 

@@ -136,3 +136,75 @@ def test_from_csv_round_trip(bundled_surface, data_dir):
     assert bundled_surface.calendar_violations == 0
     with pytest.raises(ValueError, match="header"):
         ImpliedVolSurface.from_csv(data_dir / "generate_data.py")
+
+
+def _write_csv(path, rows):
+    path.write_text("T,k,iv\n" + "".join(f"{t},{k},{iv}\n" for t, k, iv in rows))
+
+
+def test_csv_rejects_duplicate_missing_and_short_rows(tmp_path):
+    """MIN-4 / MIN-5: duplicates and gaps are named; a short row is a
+    ValueError, not a TypeError/IndexError."""
+    base = [(0.5, -0.1, 0.22), (0.5, 0.0, 0.2), (0.5, 0.1, 0.21),
+            (1.0, -0.1, 0.23), (1.0, 0.0, 0.21), (1.0, 0.1, 0.22)]
+    good = tmp_path / "good.csv"
+    _write_csv(good, base)
+    srf = ImpliedVolSurface.from_csv(good)
+    assert srf.expiries.tolist() == [0.5, 1.0] and srf.k_nodes.size == 3
+
+    dup = tmp_path / "dup.csv"
+    _write_csv(dup, base + [(1.0, 0.0, 0.25)])
+    with pytest.raises(ValueError, match="duplicate"):
+        ImpliedVolSurface.from_csv(dup)
+
+    missing = tmp_path / "missing.csv"
+    _write_csv(missing, base[:-1])
+    with pytest.raises(ValueError, match="rectangular"):
+        ImpliedVolSurface.from_csv(missing)
+
+    short = tmp_path / "short.csv"
+    short.write_text("T,k,iv\n0.5,-0.1,0.22\n0.5,0.0\n")
+    with pytest.raises(ValueError, match="3 columns"):
+        ImpliedVolSurface.from_csv(short)
+
+    extra = tmp_path / "extra.csv"
+    extra.write_text("T,k,iv,x\n0.5,-0.1,0.22,1\n")
+    with pytest.raises(ValueError, match="header"):
+        ImpliedVolSurface.from_csv(extra)
+
+    nonnum = tmp_path / "nonnum.csv"
+    nonnum.write_text("T,k,iv\n0.5,-0.1,abc\n")
+    with pytest.raises(ValueError, match="non-numeric"):
+        ImpliedVolSurface.from_csv(nonnum)
+
+    nonfinite = tmp_path / "nonfinite.csv"
+    nonfinite.write_text("T,k,iv\n0.5,-0.1,nan\n")
+    with pytest.raises(ValueError, match="non-finite"):
+        ImpliedVolSurface.from_csv(nonfinite)
+
+    empty = tmp_path / "empty.csv"
+    empty.write_text("T,k,iv\n")
+    with pytest.raises(ValueError, match="empty"):
+        ImpliedVolSurface.from_csv(empty)
+
+    # Blank lines and CRLF endings are tolerated.
+    crlf = tmp_path / "crlf.csv"
+    crlf.write_bytes(b"T,k,iv\r\n" + "".join(f"{t},{k},{iv}\r\n" for t, k, iv in base).encode() + b"\r\n")
+    assert ImpliedVolSurface.from_csv(crlf).k_nodes.size == 3
+
+
+def test_negative_total_variance_overshoot_is_counted(bundled_surface):
+    """MIN-15: a ragged slice whose spline dips to w <= 0 between nodes is
+    reported via negative_w_count + warning; clean surfaces report 0."""
+    assert bundled_surface.negative_w_count == 0
+    ks = np.array([-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3])
+    # tiny vols next to large ones -> natural spline overshoots below zero
+    row = [1.0, 0.001, 0.001, 1.0, 0.001, 0.001, 1.0]
+    with pytest.warns(UserWarning, match="overshoot"):
+        srf = ImpliedVolSurface(ks, np.array([0.5, 1.0]), np.array([row, row]))
+    assert srf.negative_w_count > 0
+    # and implied_vol indeed reads 0 there rather than raising
+    probe = np.linspace(-0.3, 0.3, 601)
+    w = np.asarray(srf.total_variance(probe, 1.0))
+    assert np.any(w < 0.0)
+    assert float(np.min(np.asarray(srf.implied_vol(probe, 1.0)))) == 0.0

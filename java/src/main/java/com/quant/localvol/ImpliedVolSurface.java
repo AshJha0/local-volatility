@@ -34,17 +34,24 @@ import java.util.TreeSet;
  * <p>Calendar arbitrage is checked node-by-node at construction: any
  * {@code w[j+1][i] < w[j][i] - 1e-12} is counted in
  * {@link #calendarViolations()} and reported via a warning on stderr —
- * detected and reported, not silently repaired.
+ * detected and reported, not silently repaired. The same policy applies to
+ * spline overshoot: every node interval of every pillar is probed at 15
+ * interior points and any {@code w <= 0} is counted in
+ * {@link #negativeWCount()} ({@link #impliedVol} reads 0% there). The
+ * surface is immutable after construction and safe to share across threads.
  */
 public final class ImpliedVolSurface {
 
     private static final double CAL_TOL = 1e-12;
+    /** Spline-overshoot scan: probes per node interval (minus one). */
+    private static final int NEG_W_SUBDIV = 16;
 
     private final double[] kNodes;
     private final double[] expiries;
     private final double[][] vols;
     private final CubicSpline1D[] splines; // one spline in k per expiry row (of total variance)
     private final int calendarViolations;
+    private final long negativeWCount;
     private final boolean singleExpiry;
 
     /**
@@ -154,16 +161,38 @@ public final class ImpliedVolSurface {
         for (int j = 0; j < n; j++) {
             this.splines[j] = new CubicSpline1D(this.kNodes, wNodes[j]);
         }
+
+        // Spline-overshoot detection (report, don't crash): probe every node
+        // interval of every pillar at NEG_W_SUBDIV - 1 interior points and
+        // count w <= 0 (impliedVol() would silently read 0% there).
+        long negatives = 0;
+        for (CubicSpline1D sp : splines) {
+            for (int i = 0; i + 1 < mK; i++) {
+                double h = this.kNodes[i + 1] - this.kNodes[i];
+                for (int p = 1; p < NEG_W_SUBDIV; p++) {
+                    if (sp.value(this.kNodes[i] + h * ((double) p / NEG_W_SUBDIV)) <= 0.0) {
+                        negatives++;
+                    }
+                }
+            }
+        }
+        this.negativeWCount = negatives;
+        if (negatives > 0) {
+            System.err.println("warning: spline overshoot: total variance <= 0 at " + negatives
+                    + " probe point(s) between nodes (implied vol reads as 0% there)");
+        }
     }
 
     /**
-     * Load a surface from a CSV with header {@code T,k,iv} (one row per grid
-     * node). The file must contain a full rectangular grid: every
-     * {@code (T, k)} pair exactly once.
+     * Load a surface from a CSV with header exactly {@code T,k,iv} (one row
+     * per grid node, three columns). The file must contain a full rectangular
+     * grid: every {@code (T, k)} pair exactly once (row order irrelevant).
      *
      * @param path CSV file path
      * @return the surface
-     * @throws IllegalArgumentException on a malformed or non-rectangular file
+     * @throws IllegalArgumentException on a missing/invalid header, an
+     *         unreadable or empty file, a short/long/non-numeric/non-finite
+     *         row, a duplicated {@code (T,k)} pair, or a non-rectangular grid
      */
     public static ImpliedVolSurface fromCsv(Path path) {
         List<double[]> rows = new ArrayList<>();
@@ -172,34 +201,38 @@ public final class ImpliedVolSurface {
             if (header == null) {
                 throw new IllegalArgumentException(path + ": empty surface CSV");
             }
-            String[] cols = header.trim().split(",");
-            int ti = -1;
-            int ki = -1;
-            int vi = -1;
-            for (int c = 0; c < cols.length; c++) {
-                switch (cols[c].trim()) {
-                    case "T" -> ti = c;
-                    case "k" -> ki = c;
-                    case "iv" -> vi = c;
-                    default -> {
-                        // extra columns are ignored
-                    }
-                }
-            }
-            if (ti < 0 || ki < 0 || vi < 0) {
+            String[] cols = header.split(",", -1);
+            if (cols.length != 3 || !cols[0].trim().equals("T") || !cols[1].trim().equals("k")
+                    || !cols[2].trim().equals("iv")) {
                 throw new IllegalArgumentException(path + ": CSV must have header columns T,k,iv");
             }
             String line;
+            int lineno = 1;
             while ((line = reader.readLine()) != null) {
+                lineno++;
                 line = line.trim();
                 if (line.isEmpty()) {
                     continue;
                 }
-                String[] parts = line.split(",");
-                rows.add(new double[]{
-                        Double.parseDouble(parts[ti].trim()),
-                        Double.parseDouble(parts[ki].trim()),
-                        Double.parseDouble(parts[vi].trim())});
+                String[] parts = line.split(",", -1);
+                if (parts.length != 3) {
+                    throw new IllegalArgumentException(path + ": line " + lineno
+                            + ": expected 3 columns (T,k,iv), got " + parts.length);
+                }
+                double[] row = new double[3];
+                for (int c = 0; c < 3; c++) {
+                    try {
+                        row[c] = Double.parseDouble(parts[c].trim());
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException(path + ": line " + lineno
+                                + ": non-numeric CSV row '" + line + "'", e);
+                    }
+                    if (!Double.isFinite(row[c])) {
+                        throw new IllegalArgumentException(path + ": line " + lineno
+                                + ": non-finite CSV value '" + line + "'");
+                    }
+                }
+                rows.add(row);
             }
         } catch (IOException e) {
             throw new IllegalArgumentException(path + ": cannot read surface CSV: " + e.getMessage(), e);
@@ -220,6 +253,10 @@ public final class ImpliedVolSurface {
         for (double[] row : rows) {
             int j = indexOf(ts, row[0]);
             int i = indexOf(ks, row[1]);
+            if (seen[j][i]) {
+                throw new IllegalArgumentException(
+                        path + ": duplicate (T,k) row T=" + row[0] + ", k=" + row[1]);
+            }
             grid[j][i] = row[2];
             seen[j][i] = true;
         }
@@ -311,6 +348,16 @@ public final class ImpliedVolSurface {
     /** @return number of node pairs where total variance decreases with expiry */
     public int calendarViolations() {
         return calendarViolations;
+    }
+
+    /**
+     * @return number of probe points (15 per node interval, per pillar) where
+     *         the natural spline overshoots to total variance {@code <= 0}
+     *         ({@link #impliedVol} reads 0% there); detected at construction
+     *         and reported on stderr, never repaired; 0 for a clean surface
+     */
+    public long negativeWCount() {
+        return negativeWCount;
     }
 
     /** @return true when only one pillar expiry was supplied */

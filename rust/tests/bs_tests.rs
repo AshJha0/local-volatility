@@ -134,3 +134,18 @@ fn implied_vol_rejects_arbitrage_and_bad_inputs() {
     assert!(implied_vol(5.0, 100.0, 0.0, 0.0, 0.0, 1.0, true).is_err()); // K = 0
     assert!(implied_vol(f64::NAN, 100.0, 100.0, 0.0, 0.0, 1.0, true).is_err());
 }
+
+#[test]
+fn market_log_forward_validation_and_value() {
+    // MIN-6: log_forward validates expiry in every port.
+    let mkt = localvol::Market::new(100.0, 0.03, 0.01).unwrap();
+    let lf = mkt.log_forward(2.0).unwrap();
+    assert!((lf - (100.0_f64.ln() + 0.02 * 2.0)).abs() < 1e-15);
+    assert_eq!(mkt.log_forward(0.0).unwrap(), 100.0_f64.ln());
+    assert!(mkt.log_forward(-1.0).is_err());
+    assert!(mkt.log_forward(f64::NAN).is_err());
+    assert!(mkt.forward(f64::INFINITY).is_err());
+    assert!(localvol::Market::new(100.0, f64::NAN, 0.0).is_err());
+    assert!(localvol::Market::new(100.0, 0.0, f64::INFINITY).is_err());
+    assert!(localvol::Market::new(0.0, 0.0, 0.0).is_err());
+}

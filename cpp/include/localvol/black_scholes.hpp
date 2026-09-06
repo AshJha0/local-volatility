@@ -44,6 +44,9 @@ double bs_vega(double spot, double strike, double rate, double dividend,
 /// ~1e-10-accurate result deterministically: exactly \p iterations halvings
 /// of the fixed bracket, returning the midpoint. Prices outside the static
 /// no-arbitrage bounds (with slack 1e-12 * max(1, spot)) are rejected.
+/// The defaults ([1e-9, 5.0], 100 halvings) are the cross-language golden
+/// contract; other values are validated (0 < lo < hi finite, iterations
+/// >= 1) but leave that contract.
 /// \throws std::invalid_argument on invalid inputs or out-of-bounds price.
 double implied_vol(double price, double spot, double strike, double rate,
                    double dividend, double expiry, bool is_call = true,

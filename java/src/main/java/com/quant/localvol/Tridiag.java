@@ -9,8 +9,12 @@ package com.quant.localvol;
  * Gaussian elimination without pivoting in O(n): it is stable for the
  * diagonally-dominant systems produced by the Crank-Nicolson discretisation
  * (the diagonal {@code 1 + theta dt (2a/h^2 + r)} dominates the off-diagonals
- * whenever the scheme's local Peclet condition {@code |mu| h <= 2 a} holds,
- * which the PDE grids used here satisfy by construction).
+ * whenever both off-diagonals are non-negative). Central differencing gives
+ * that only under the mesh Peclet condition {@code |mu| h <= 2 a}, which a
+ * flat vol on the default grid satisfies but a floored local vol with a few
+ * percent of carry does not; {@link Pde} therefore switches those nodes to
+ * upwind differencing, which restores non-negative off-diagonals and hence
+ * the diagonal dominance this kernel relies on.
  *
  * <p>No library banded solver is used anywhere in the pricing path — this is
  * the single linear-algebra kernel, ported line for line from the Python

@@ -140,3 +140,78 @@ fn validation() {
     let tiny = McSettings { n_paths: 1, ..McSettings::default() };
     assert!(price_european_mc(&mkt, 100.0, 1.0, &flat, true, &tiny).is_err());
 }
+
+#[test]
+fn localvol_mc_matches_pde_with_carry() {
+    // MAJ-7: with r != q the lookup k = X_n - ln F(t_n) is exercised
+    // (a ln S0 lookup lands 4-5 SE away from the PDE).
+    let lv = bundled_localvol();
+    let markets = [
+        Market::new(100.0, 0.05, 0.02).unwrap(),
+        Market::fx(1.10, 0.03, -0.01).unwrap(),
+    ];
+    for mkt in markets {
+        let strike = mkt.spot();
+        let settings = PdeSettings {
+            sigma_ref: Some(lv.surface().implied_vol(0.0, 1.0).unwrap()),
+            ..PdeSettings::default()
+        };
+        let pde = price_european_pde(&mkt, strike, 1.0, &VolInput::Local(&lv), true, &settings)
+            .unwrap();
+        let res =
+            price_european_mc(&mkt, strike, 1.0, &VolInput::Local(&lv), true, &mc(20_000, 100))
+                .unwrap();
+        assert!(
+            res.within(pde, 3.0),
+            "S0={}: MC {}±{} vs PDE {pde}",
+            mkt.spot(),
+            res.price,
+            res.stderr
+        );
+    }
+}
+
+#[test]
+fn mc_put_call_parity_under_local_vol() {
+    let lv = bundled_localvol();
+    let mkt = Market::new(100.0, 0.03, 0.01).unwrap();
+    let s = McSettings { seed: 5, ..mc(20_000, 100) };
+    let vol = VolInput::Local(&lv);
+    let c = price_european_mc(&mkt, 100.0, 1.0, &vol, true, &s).unwrap();
+    let p = price_european_mc(&mkt, 100.0, 1.0, &vol, false, &s).unwrap();
+    let parity = 100.0 * (-0.01_f64).exp() - 100.0 * (-0.03_f64).exp();
+    assert!(
+        (c.price - p.price - parity).abs() < 3.0 * (c.stderr * c.stderr + p.stderr * p.stderr).sqrt(),
+        "parity violated: {} - {} vs {parity}",
+        c.price,
+        p.price
+    );
+}
+
+#[test]
+fn mc_rejects_tiny_path_counts() {
+    // MAJ-8: n_paths = 2 with antithetic used to return stderr = NaN.
+    let mkt = Market::new(100.0, 0.02, 0.0).unwrap();
+    let flat = VolInput::Flat(0.2);
+    let err = price_european_mc(&mkt, 100.0, 1.0, &flat, true, &mc(2, 5)).unwrap_err();
+    assert!(err.to_string().contains("n_paths"), "{err}");
+    let one = McSettings { antithetic: false, ..mc(1, 5) };
+    assert!(price_european_mc(&mkt, 100.0, 1.0, &flat, true, &one).is_err());
+    assert!(price_up_out_call_mc(&mkt, 100.0, 130.0, 1.0, &flat, &mc(2, 5), true).is_err());
+    // deep ITM strike so every path pays and the sample spread is non-zero
+    let four = price_european_mc(&mkt, 50.0, 1.0, &flat, true, &mc(4, 5)).unwrap();
+    assert!(four.price.is_finite() && four.stderr.is_finite() && four.stderr > 0.0);
+    let two = McSettings { antithetic: false, ..mc(2, 5) };
+    let r2 = price_european_mc(&mkt, 50.0, 1.0, &flat, true, &two).unwrap();
+    assert!(r2.stderr.is_finite() && r2.stderr > 0.0);
+}
+
+#[test]
+fn mc_rejects_nan_flat_vol_and_bad_steps() {
+    let mkt = Market::new(100.0, 0.02, 0.0).unwrap();
+    assert!(price_european_mc(&mkt, 100.0, 1.0, &VolInput::Flat(f64::NAN), true, &mc(100, 5)).is_err());
+    assert!(price_european_mc(&mkt, 100.0, 1.0, &VolInput::Flat(-0.2), true, &mc(100, 5)).is_err());
+    assert!(price_european_mc(&mkt, 100.0, f64::NAN, &VolInput::Flat(0.2), true, &mc(100, 5)).is_err());
+    assert!(price_european_mc(&mkt, f64::INFINITY, 1.0, &VolInput::Flat(0.2), true, &mc(100, 5)).is_err());
+    assert!(price_up_out_call_mc(&mkt, 100.0, f64::NAN, 1.0, &VolInput::Flat(0.2), &mc(100, 5), true).is_err());
+}

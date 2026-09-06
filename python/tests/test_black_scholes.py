@@ -98,3 +98,37 @@ def test_implied_vol_rejects_arbitrage_and_bad_inputs():
         implied_vol(-1.0, 100, 100, 0.0, 0.0, 1.0, True)  # below intrinsic
     with pytest.raises(ValueError):
         implied_vol(5.0, 100, 100, 0.0, 0.0, 0.0, True)  # T = 0
+
+
+def test_implied_vol_rejects_bad_bracket_and_iterations():
+    """MIN-7: non-default lo/hi/iterations are validated."""
+    price = bs_price(100, 100, 0.02, 0.01, 0.2, 1.0, True)
+    with pytest.raises(ValueError, match="bracket"):
+        implied_vol(price, 100, 100, 0.02, 0.01, 1.0, True, lo=5.0, hi=1e-9)
+    with pytest.raises(ValueError, match="bracket"):
+        implied_vol(price, 100, 100, 0.02, 0.01, 1.0, True, lo=0.0, hi=1.0)
+    with pytest.raises(ValueError, match="bracket"):
+        implied_vol(price, 100, 100, 0.02, 0.01, 1.0, True, lo=1e-9, hi=float("inf"))
+    with pytest.raises(ValueError, match="iterations"):
+        implied_vol(price, 100, 100, 0.02, 0.01, 1.0, True, iterations=0)
+    with pytest.raises(ValueError, match="price must be finite"):
+        implied_vol(float("nan"), 100, 100, 0.02, 0.01, 1.0, True)
+    # the default contract: exactly 100 halvings of [1e-9, 5]
+    assert implied_vol(price, 100, 100, 0.02, 0.01, 1.0, True) == pytest.approx(0.2, abs=1e-10)
+
+
+def test_market_log_forward_validation_and_value():
+    """MIN-6: log_forward validates expiry in every port."""
+    mkt = Market(100.0, 0.03, 0.01)
+    assert mkt.log_forward(2.0) == pytest.approx(math.log(100.0) + 0.02 * 2.0, abs=1e-15)
+    assert mkt.log_forward(0.0) == math.log(100.0)
+    with pytest.raises(ValueError):
+        mkt.log_forward(-1.0)
+    with pytest.raises(ValueError):
+        mkt.log_forward(float("nan"))
+    with pytest.raises(ValueError):
+        mkt.forward(float("inf"))
+    with pytest.raises(ValueError):
+        Market(100.0, float("nan"), 0.0)
+    with pytest.raises(ValueError):
+        Market(100.0, 0.0, float("inf"))

@@ -8,7 +8,7 @@ flowchart TD
     end
 
     CSV -->|"from_csv: sort, verify rectangular"| SURF["ImpliedVolSurface\nw = iv^2 T\nspline in k, linear-in-w in T\ncalendar check (report)"]
-    SURF -->|"w(k,T) queries"| DUP["DupireLocalVol\nGatheral formula\nDK=1e-3, DT=1e-4\nclamp [1%, 500%] + counters"]
+    SURF -->|"w(k,T) queries"| DUP["DupireLocalVol\nGatheral formula, stencil clamped in the quoted box\nDK=1e-3, DT=1e-4, T=0: BBF limit\nclamp [1%, 500%] + atomic counters"]
 
     MKT["Market\nS0, r, q (equity)\nS0, rd, rf (FX)"] --> PDE
     MKT --> MC
@@ -18,7 +18,7 @@ flowchart TD
     PDE -->|price at node M/2| INV["implied_vol\nbisection, 100 halvings"]
     MC -->|"price ± stderr"| XCHK["cross-check\n|PDE − MC| ≤ 3 SE"]
     PDE --> XCHK
-    INV --> RT["round-trip report\nmax interior error under 30 bp"]
+    INV --> RT["round-trip report\nmax interior error 2.73 bp (target 30, tests 5)"]
     SURF -.->|input vols| RT
 
     GOLD -.->|"asserted by all 4 test suites"| PDE

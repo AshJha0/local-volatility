@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use localvol::{DupireLocalVol, ImpliedVolSurface};
 
-/// `<repo>/03-local-volatility/data`, resolved relative to the rust/ dir.
+/// `<repo>/local-volatility/data`, resolved relative to the rust/ dir.
 pub fn data_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../data"))
 }

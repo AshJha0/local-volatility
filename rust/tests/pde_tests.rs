@@ -8,6 +8,7 @@ use localvol::{
     PdeSettings, PsorSettings, VolInput,
 };
 
+
 fn settings(m: usize, n: usize) -> PdeSettings {
     PdeSettings {
         num_space: m,
@@ -241,4 +242,102 @@ fn validation() {
         &PsorSettings { tol: 0.0, ..PsorSettings::default() }
     )
     .is_err());
+}
+
+#[test]
+fn psor_nonconvergence_returns_finite() {
+    // max_iter = 1 cannot converge: a warning per time step is logged and
+    // the returned price is finite and non-negative (report, don't fail).
+    let mkt = Market::new(100.0, 0.05, 0.0).unwrap();
+    let psor = PsorSettings { max_iter: 1, ..PsorSettings::default() };
+    let p = price_american_put_pde(&mkt, 100.0, 1.0, &VolInput::Flat(0.2), &settings(100, 20), &psor)
+        .unwrap();
+    assert!(p.is_finite() && p >= 0.0);
+    assert_close(p, 6.4776, 1e-3, "unconverged PSOR price");
+}
+
+#[test]
+fn american_put_deep_itm_equals_intrinsic() {
+    let mkt = Market::new(50.0, 0.05, 0.0).unwrap();
+    let p = price_american_put_pde(&mkt, 100.0, 1.0, &VolInput::Flat(0.2), &settings(100, 50), &PsorSettings::default())
+        .unwrap();
+    assert_close(p, 50.0, 1e-8, "deep ITM American put");
+}
+
+#[test]
+fn american_put_negative_rate_equals_european() {
+    // r < 0, q = 0: early exercise is never optimal for a put.
+    let mkt = Market::new(100.0, -0.02, 0.0).unwrap();
+    let s = settings(100, 50);
+    let eur = price_european_pde(&mkt, 100.0, 1.0, &VolInput::Flat(0.2), false, &s).unwrap();
+    let ame = price_american_put_pde(&mkt, 100.0, 1.0, &VolInput::Flat(0.2), &s, &PsorSettings::default())
+        .unwrap();
+    assert_close(ame, eur, 1e-6, "American == European at r < 0");
+    assert!(ame >= eur - 1e-12);
+}
+
+#[test]
+fn localvol_pde_grid_convergence() {
+    // Observed order vs a 400x400 reference in [0.8, 2.5] under local vol.
+    let lv = bundled_localvol();
+    let mkt = Market::new(100.0, 0.0, 0.0).unwrap();
+    let price_at = |m: usize| {
+        let s = PdeSettings { sigma_ref: Some(0.2), ..settings(m, m) };
+        price_european_pde(&mkt, 100.0, 1.0, &VolInput::Local(&lv), true, &s).unwrap()
+    };
+    let reference = price_at(400);
+    let errs: Vec<f64> = [50, 100, 200].iter().map(|&m| (price_at(m) - reference).abs()).collect();
+    for i in 0..2 {
+        let order = (errs[i] / errs[i + 1]).log2();
+        assert!((0.8..=2.5).contains(&order), "order {order} (errors {errs:?})");
+    }
+}
+
+#[test]
+fn peclet_violation_switches_to_upwind_and_stays_monotone() {
+    // MAJ-5: 1% vol with 10% carry violates |mu| h <= 2a on the default
+    // grid. Central differencing yields a negative put price (-2.95e-6) and
+    // grid values down to -0.084; upwinding keeps everything >= 0 and monotone.
+    let mkt = Market::new(100.0, 0.10, 0.0).unwrap();
+    let s = settings(100, 50);
+    let put = price_european_pde_grid(&mkt, 90.0, 1.0, &VolInput::Flat(0.01), false, &s).unwrap();
+    assert!(put.price >= 0.0 && put.price < 1e-6, "put {}", put.price); // BS value ~1e-95
+    assert!(put.values.iter().all(|&v| v >= 0.0));
+    assert!(put.values.windows(2).all(|p| p[1] - p[0] <= 1e-14)); // nonincreasing in S
+    let call = price_european_pde_grid(&mkt, 90.0, 1.0, &VolInput::Flat(0.01), true, &s).unwrap();
+    assert!(call.values.windows(2).all(|p| p[1] - p[0] >= -1e-14));
+    let bs = bs_price(100.0, 90.0, 0.10, 0.0, 0.01, 1.0, true).unwrap();
+    assert_close(call.price, bs, 2e-3 * bs, "upwind call vs BS");
+    let amer = price_american_put_pde(&mkt, 90.0, 1.0, &VolInput::Flat(0.01), &s, &PsorSettings::default())
+        .unwrap();
+    assert!((0.0..1e-6).contains(&amer), "American {amer}");
+}
+
+#[test]
+fn psor_rejects_nan_tol_and_bad_iters() {
+    // MIN-12: tol = NaN must be rejected eagerly, not spin every time step.
+    let mkt = Market::new(100.0, 0.05, 0.0).unwrap();
+    let flat = VolInput::Flat(0.2);
+    let s = PdeSettings::default();
+    for psor in [
+        PsorSettings { tol: f64::NAN, ..PsorSettings::default() },
+        PsorSettings { tol: f64::INFINITY, ..PsorSettings::default() },
+        PsorSettings { max_iter: 0, ..PsorSettings::default() },
+    ] {
+        let err = price_american_put_pde(&mkt, 100.0, 1.0, &flat, &s, &psor).unwrap_err();
+        assert!(err.to_string().contains("tol"), "{err}");
+    }
+    assert!(price_european_pde(&mkt, 100.0, 1.0, &flat, true, &PdeSettings { sigma_ref: Some(-1.0), ..s }).is_ok());
+    let lv = bundled_localvol();
+    assert!(price_european_pde(&mkt, 100.0, 1.0, &VolInput::Local(&lv), true, &PdeSettings { sigma_ref: Some(-1.0), ..s }).is_err());
+    assert!(price_european_pde(&mkt, 100.0, 1.0, &VolInput::Local(&lv), true, &PdeSettings { sigma_ref: Some(f64::NAN), ..s }).is_err());
+}
+
+#[test]
+fn pde_is_deterministic() {
+    let mkt = Market::new(100.0, 0.03, 0.01).unwrap();
+    let s = settings(120, 60);
+    let a = price_european_pde(&mkt, 105.0, 0.7, &VolInput::Flat(0.23), true, &s).unwrap();
+    let b = price_european_pde(&mkt, 105.0, 0.7, &VolInput::Flat(0.23), true, &s).unwrap();
+    assert_eq!(a, b);
 }

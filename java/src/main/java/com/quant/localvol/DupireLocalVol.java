@@ -1,5 +1,7 @@
 package com.quant.localvol;
 
+import java.util.concurrent.atomic.LongAdder;
+
 /**
  * Dupire local volatility in total-variance (Gatheral) form.
  *
@@ -22,8 +24,32 @@ package com.quant.localvol;
  *
  * <p><b>Numerics</b>: derivatives are central finite differences with
  * <b>fixed steps</b> {@code DK = 1e-3} and {@code DT = 1e-4}; at
- * {@code T <= DT} the time derivative switches to a forward difference. These
- * exact step sizes are part of the cross-language contract.
+ * {@code 0 < T <= DT} the time derivative switches to a forward difference.
+ * These exact step sizes are part of the cross-language contract.
+ *
+ * <p><b>Stencil clamp at the quoted wings</b>: the surface is flat in
+ * {@code k} beyond the last quoted strikes, so {@code w} is only C^0 there (a
+ * natural spline has {@code w'' = 0} but {@code w' != 0} at the end node). A
+ * central stencil straddling that kink would read {@code d2w/dk2 ~ -w'/DK}
+ * and cap the vol at 500% <i>at the quoted wing</i>. The query is therefore
+ * clamped into {@code [kMin + DK, kMax - DK]} before differencing (whenever
+ * the box is wider than {@code 2 DK}) and the clamped {@code k} is used in
+ * every term: local vol is constant in {@code k} beyond {@code kMax - DK} and
+ * continuous across the wing node.
+ *
+ * <p><b>Short-expiry limit</b>: {@code w(k, 0) = 0} exactly, so
+ * {@code vol(k, 0)} is defined as the {@code T -> 0+} limit (Berestycki,
+ * Busca, Florent 2002) with {@code s(k) = impliedVol(k, 0)}:
+ * {@code sigma_loc(k, 0) = s / (1 - k s'/s)}, {@code s'} by the same central
+ * {@code DK} step. The {@code T > 0} branch converges to it (flat forward
+ * variance below the first pillar), so {@code vol} is continuous at
+ * {@code T = 0}.
+ *
+ * <p><b>Thread safety</b>: {@link #vol} / {@link #localVariance} are safe to
+ * call concurrently on one shared instance (the surface is immutable; the
+ * counters are {@link LongAdder}s, so their total is exact while a read taken
+ * mid-computation is only a snapshot). Call {@link #resetCounters()} between
+ * phases, not during one.
  *
  * <p><b>Robustness</b>: the local vol is clamped to {@code [1%, 500%]}.
  * Numerator {@code <= 0} (calendar arbitrage) floors; denominator
@@ -45,8 +71,8 @@ public final class DupireLocalVol implements LocalVolFn {
     private static final double W_EPS = 1e-12;
 
     private final ImpliedVolSurface surface;
-    private long floorCount;
-    private long capCount;
+    private final LongAdder floorCount = new LongAdder();
+    private final LongAdder capCount = new LongAdder();
 
     /**
      * @param surface the implied surface to differentiate; must not be null
@@ -65,18 +91,57 @@ public final class DupireLocalVol implements LocalVolFn {
 
     /** Zero the floor/cap violation counters. */
     public void resetCounters() {
-        floorCount = 0;
-        capCount = 0;
+        floorCount.reset();
+        capCount.reset();
     }
 
     /** @return cumulative number of floor clamps since the last reset */
     public long floorCount() {
-        return floorCount;
+        return floorCount.sum();
     }
 
     /** @return cumulative number of cap clamps since the last reset */
     public long capCount() {
-        return capCount;
+        return capCount.sum();
+    }
+
+    /**
+     * Shared clamp policy: {@code num <= 0} floors, else {@code den <= 0}
+     * caps, else {@code sqrt(num/den)} clipped into {@code [FLOOR, CAP]};
+     * every hit counted. Returns the clamped local <i>variance</i>.
+     */
+    private double clampAndCount(double num, double den) {
+        double vol;
+        if (num <= 0.0) {
+            vol = FLOOR;      // no forward variance -> floor
+            floorCount.increment();
+        } else if (den <= 0.0) {
+            vol = CAP;        // butterfly arbitrage -> cap
+            capCount.increment();
+        } else {
+            vol = Math.sqrt(num / den);
+            if (vol < FLOOR) {
+                floorCount.increment();
+                vol = FLOOR;
+            } else if (vol > CAP) {
+                capCount.increment();
+                vol = CAP;
+            }
+        }
+        return vol * vol;
+    }
+
+    /** Berestycki-Busca-Florent {@code T -> 0+} limit at an already-clamped k. */
+    private double shortTimeVariance(double k) {
+        double s = surface.impliedVol(k, 0.0);
+        double sUp = surface.impliedVol(k + DK, 0.0);
+        double sDn = surface.impliedVol(k - DK, 0.0);
+        double dsdk = (sUp - sDn) / (2.0 * DK);
+        double ss = Math.max(s, W_EPS); // guard s == 0 (spline overshoot to w <= 0)
+        double denom = 1.0 - k * dsdk / ss;
+        // Same clamp policy as T > 0 with num = s^2 and den = denom |denom|:
+        // sqrt(num/den) = s/denom when denom > 0, s == 0 floors, denom <= 0 caps.
+        return clampAndCount(s * s, denom * Math.abs(denom));
     }
 
     /**
@@ -92,6 +157,16 @@ public final class DupireLocalVol implements LocalVolFn {
         }
         if (!Double.isFinite(k)) {
             throw new IllegalArgumentException("k must be finite");
+        }
+        // Clamp into [kMin + DK, kMax - DK] so that no central stencil
+        // straddles the C^0 kink of the flat wing extrapolation.
+        double kMin = surface.kMin();
+        double kMax = surface.kMax();
+        if (kMax - kMin > 2.0 * DK) {
+            k = Math.min(Math.max(k, kMin + DK), kMax - DK);
+        }
+        if (expiry == 0.0) {
+            return shortTimeVariance(k);
         }
         double w = surface.totalVariance(k, expiry);
         double wUp = surface.totalVariance(k + DK, expiry);
@@ -114,24 +189,7 @@ public final class DupireLocalVol implements LocalVolFn {
                 + 0.25 * (-0.25 - 1.0 / ws + (k * k) / (ws * ws)) * dwdk * dwdk
                 + 0.5 * d2wdk2;
 
-        double vol;
-        if (dwdt <= 0.0) {
-            vol = FLOOR;      // no forward variance -> floor
-            floorCount++;
-        } else if (denom <= 0.0) {
-            vol = CAP;        // butterfly-arb wing -> cap
-            capCount++;
-        } else {
-            vol = Math.sqrt(dwdt / denom);
-            if (vol < FLOOR) {
-                floorCount++;
-                vol = FLOOR;
-            } else if (vol > CAP) {
-                capCount++;
-                vol = CAP;
-            }
-        }
-        return vol * vol;
+        return clampAndCount(dwdt, denom);
     }
 
     /**
@@ -149,6 +207,6 @@ public final class DupireLocalVol implements LocalVolFn {
     /** @return human-readable clamp summary for demos/logs */
     public String violationReport() {
         return String.format("local-vol clamps: floor(%.0f%%) hit %dx, cap(%.0f%%) hit %dx",
-                FLOOR * 100.0, floorCount, CAP * 100.0, capCount);
+                FLOOR * 100.0, floorCount(), CAP * 100.0, capCount());
     }
 }

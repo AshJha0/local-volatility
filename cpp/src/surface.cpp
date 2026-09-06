@@ -1,9 +1,12 @@
 #include "localvol/surface.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <fstream>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -15,6 +18,7 @@ namespace localvol {
 
 namespace {
 constexpr double kCalTol = 1e-12;  // calendar-arbitrage detection tolerance
+constexpr int kNegWSubdiv = 16;    // spline-overshoot scan: probes per interval (minus one)
 }
 
 // ---------------------------------------------------------------- spline
@@ -149,7 +153,50 @@ ImpliedVolSurface::ImpliedVolSurface(std::vector<double> k_nodes,
     for (std::size_t j = 0; j < n; ++j) {
         splines_.emplace_back(k_nodes_, w[j]);
     }
+
+    // Spline-overshoot detection (report, don't crash): probe every node
+    // interval of every pillar at kNegWSubdiv - 1 interior points and count
+    // w <= 0 (implied_vol() would silently read 0% there).
+    for (const CubicSpline1D& sp : splines_) {
+        for (std::size_t i = 0; i + 1 < m; ++i) {
+            const double h = k_nodes_[i + 1] - k_nodes_[i];
+            for (int p = 1; p < kNegWSubdiv; ++p) {
+                if (sp(k_nodes_[i] + h * (static_cast<double>(p) / kNegWSubdiv)) <= 0.0) {
+                    ++negative_w_count_;
+                }
+            }
+        }
+    }
+    if (negative_w_count_ > 0) {
+        std::cerr << "localvol warning: spline overshoot — total variance <= 0 at "
+                  << negative_w_count_ << " probe point(s) between nodes\n";
+    }
 }
+
+namespace {
+
+/// Locale-independent decimal parse of a trimmed CSV field (std::stod would
+/// honour a comma-decimal process locale and read "0.25" as 0).
+bool parse_double(std::string field, double& out) {
+    const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    field.erase(field.begin(), std::find_if(field.begin(), field.end(), not_space));
+    field.erase(std::find_if(field.rbegin(), field.rend(), not_space).base(), field.end());
+    if (field.empty()) return false;
+    const char* first = field.data();
+    const char* last = first + field.size();
+    if (*first == '+') ++first;  // from_chars does not accept a leading '+'
+    const auto res = std::from_chars(first, last, out);
+    return res.ec == std::errc{} && res.ptr == last;
+}
+
+std::string trim(const std::string& s) {
+    const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    const auto b = std::find_if(s.begin(), s.end(), not_space);
+    const auto e = std::find_if(s.rbegin(), s.rend(), not_space).base();
+    return b < e ? std::string(b, e) : std::string();
+}
+
+}  // namespace
 
 ImpliedVolSurface ImpliedVolSurface::from_csv(const std::string& path) {
     std::ifstream in(path);
@@ -158,26 +205,42 @@ ImpliedVolSurface ImpliedVolSurface::from_csv(const std::string& path) {
     if (!std::getline(in, line)) throw std::invalid_argument(path + ": empty surface CSV");
     // Strip a possible trailing CR (Windows line endings).
     if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (line != "T,k,iv") {
-        throw std::invalid_argument(path + ": CSV must have header columns T,k,iv");
+    {
+        std::istringstream hs(line);
+        std::string c1, c2, c3, extra;
+        const bool three = std::getline(hs, c1, ',') && std::getline(hs, c2, ',') &&
+                           std::getline(hs, c3, ',') && !std::getline(hs, extra, ',');
+        if (!three || trim(c1) != "T" || trim(c2) != "k" || trim(c3) != "iv") {
+            throw std::invalid_argument(path + ": CSV must have header columns T,k,iv");
+        }
     }
     struct Row {
         double t, k, iv;
     };
     std::vector<Row> rows;
+    std::size_t lineno = 1;
     while (std::getline(in, line)) {
+        ++lineno;
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
+        if (trim(line).empty()) continue;
         std::istringstream ss(line);
-        std::string f1, f2, f3;
-        if (!std::getline(ss, f1, ',') || !std::getline(ss, f2, ',') || !std::getline(ss, f3)) {
-            throw std::invalid_argument(path + ": malformed CSV row '" + line + "'");
+        std::string f1, f2, f3, extra;
+        const bool three = std::getline(ss, f1, ',') && std::getline(ss, f2, ',') &&
+                           std::getline(ss, f3, ',') && !std::getline(ss, extra, ',');
+        if (!three) {
+            throw std::invalid_argument(path + ": line " + std::to_string(lineno) +
+                                        ": expected 3 columns (T,k,iv) in '" + line + "'");
         }
-        try {
-            rows.push_back({std::stod(f1), std::stod(f2), std::stod(f3)});
-        } catch (const std::exception&) {
-            throw std::invalid_argument(path + ": non-numeric CSV row '" + line + "'");
+        Row r{};
+        if (!parse_double(f1, r.t) || !parse_double(f2, r.k) || !parse_double(f3, r.iv)) {
+            throw std::invalid_argument(path + ": line " + std::to_string(lineno) +
+                                        ": non-numeric CSV row '" + line + "'");
         }
+        if (!std::isfinite(r.t) || !std::isfinite(r.k) || !std::isfinite(r.iv)) {
+            throw std::invalid_argument(path + ": line " + std::to_string(lineno) +
+                                        ": non-finite CSV value '" + line + "'");
+        }
+        rows.push_back(r);
     }
     if (rows.empty()) throw std::invalid_argument(path + ": empty surface CSV");
 
@@ -199,13 +262,23 @@ ImpliedVolSurface ImpliedVolSurface::from_csv(const std::string& path) {
         kv.second = ks.size();
         ks.push_back(kv.first);
     }
-    std::vector<std::vector<double>> vols(ts.size(), std::vector<double>(ks.size(), -1.0));
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    std::vector<std::vector<double>> vols(ts.size(), std::vector<double>(ks.size(), nan));
+    std::vector<std::vector<char>> seen(ts.size(), std::vector<char>(ks.size(), 0));
     for (const Row& r : rows) {
-        vols[ti[r.t]][ki[r.k]] = r.iv;
+        const std::size_t j = ti[r.t];
+        const std::size_t i = ki[r.k];
+        if (seen[j][i]) {
+            std::ostringstream os;
+            os << path << ": duplicate (T,k) row T=" << r.t << ", k=" << r.k;
+            throw std::invalid_argument(os.str());
+        }
+        seen[j][i] = 1;
+        vols[j][i] = r.iv;
     }
-    for (const auto& row : vols) {
-        for (double v : row) {
-            if (v < 0.0) {
+    for (const auto& row : seen) {
+        for (char s : row) {
+            if (!s) {
                 throw std::invalid_argument(
                     path + ": surface grid is not rectangular (missing (T,k) pairs)");
             }

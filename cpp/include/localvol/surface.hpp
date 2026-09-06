@@ -21,6 +21,12 @@
 /// Extrapolation: flat in k beyond the wings (query clamped to the node
 /// range); w * T/T1 below the first pillar (flat forward variance); linear
 /// in w beyond the last pillar with the slope floored at 0.
+///
+/// Data-quality conditions are reported, never raised: calendar arbitrage
+/// at the nodes (calendar_violations()) and spline overshoot to w <= 0
+/// between nodes (negative_w_count()) are counted at construction and
+/// logged to stderr. The object is immutable after construction and safe
+/// to share across threads.
 
 #include <string>
 #include <vector>
@@ -69,10 +75,12 @@ public:
                       std::vector<double> expiries,
                       std::vector<std::vector<double>> vols);
 
-    /// Load from a CSV with header T,k,iv (one row per grid node; full
-    /// rectangular grid, order irrelevant).
+    /// Load from a CSV with header exactly `T,k,iv` (one row per grid node,
+    /// three columns; full rectangular grid, every (T,k) pair exactly once,
+    /// order irrelevant). Parsing is locale-independent (std::from_chars).
     /// \throws std::invalid_argument on a missing/invalid header, empty
-    ///         file, unreadable path, or a non-rectangular grid.
+    ///         file, unreadable path, a short/long/non-numeric/non-finite
+    ///         row, a duplicated (T,k) pair, or a non-rectangular grid.
     static ImpliedVolSurface from_csv(const std::string& path);
 
     /// Total implied variance w(k, T) under the documented rules
@@ -88,6 +96,12 @@ public:
     /// (calendar arbitrage), detected at construction.
     int calendar_violations() const { return calendar_violations_; }
 
+    /// Number of probe points (15 per node interval, per pillar) where the
+    /// natural spline overshoots to total variance <= 0 (implied_vol reads
+    /// 0% there). Detected at construction and reported on stderr, never
+    /// repaired; 0 for a well-behaved surface.
+    long negative_w_count() const { return negative_w_count_; }
+
     /// True when only one pillar expiry was supplied.
     bool single_expiry() const { return expiries_.size() == 1; }
 
@@ -102,6 +116,7 @@ private:
     std::vector<std::vector<double>> vols_;
     std::vector<CubicSpline1D> splines_;  ///< one spline in k per expiry row.
     int calendar_violations_ = 0;
+    long negative_w_count_ = 0;
 };
 
 }  // namespace localvol

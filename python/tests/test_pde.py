@@ -149,3 +149,118 @@ def test_validation():
         price_american_put_pde(mkt, 100.0, 1.0, 0.2, omega=2.5)
     with pytest.raises(ValueError, match="market"):
         price_european_pde("spot", 100.0, 1.0, 0.2)  # type: ignore[arg-type]
+
+
+def test_psor_nonconvergence_warns_and_returns_finite():
+    """max_iter = 1 cannot converge: a RuntimeWarning per time step, and the
+    returned price is finite and non-negative (report, don't crash)."""
+    mkt = Market(100.0, 0.05, 0.0)
+    with pytest.warns(RuntimeWarning, match="PSOR did not converge"):
+        price = price_american_put_pde(mkt, 100.0, 1.0, 0.2, num_space=100, num_time=20, max_iter=1)
+    assert math.isfinite(price) and price >= 0.0
+    assert price == pytest.approx(6.4776, abs=1e-3)
+
+
+def test_american_put_deep_itm_equals_intrinsic():
+    """Deep ITM: the lower Dirichlet boundary / obstacle pin V = K - S."""
+    price = price_american_put_pde(Market(50.0, 0.05, 0.0), 100.0, 1.0, 0.2, num_space=100, num_time=50)
+    assert abs(price - 50.0) < 1e-8
+
+
+def test_american_put_negative_rate_equals_european():
+    """r < 0, q = 0: early exercise is never optimal for a put."""
+    mkt = Market(100.0, -0.02, 0.0)
+    eur = price_european_pde(mkt, 100.0, 1.0, 0.2, is_call=False, num_space=100, num_time=50)
+    ame = price_american_put_pde(mkt, 100.0, 1.0, 0.2, num_space=100, num_time=50)
+    assert abs(ame - eur) < 1e-6
+    assert ame >= eur - 1e-12
+
+
+def test_localvol_pde_grid_convergence(bundled_localvol):
+    """Observed order vs a 400x400 reference lies in [0.8, 2.5] under local
+    vol (frozen-coefficient CN is formally first order in time)."""
+    mkt = Market(100.0, 0.0, 0.0)
+    ref = price_european_pde(mkt, 100.0, 1.0, bundled_localvol.vol, num_space=400, num_time=400, sigma_ref=0.2)
+    errs = [
+        abs(price_european_pde(mkt, 100.0, 1.0, bundled_localvol.vol, num_space=m, num_time=m, sigma_ref=0.2) - ref)
+        for m in (50, 100, 200)
+    ]
+    orders = [math.log2(errs[i] / errs[i + 1]) for i in range(2)]
+    for o in orders:
+        assert 0.8 <= o <= 2.5, f"orders {orders}, errors {errs}"
+
+
+def test_peclet_violation_switches_to_upwind_and_stays_monotone():
+    """MAJ-5 regression: 1% vol with 10% carry violates |mu| h <= 2a on the
+    default grid.  Central differencing then yields a negative put price
+    (-2.95e-6) and grid values down to -0.084; the upwind switch keeps the
+    put price and every grid value >= 0 and the grid monotone."""
+    mkt = Market(100.0, 0.10, 0.0)
+    res = price_european_pde(mkt, 90.0, 1.0, 0.01, is_call=False, num_space=100, num_time=50, return_grid=True)
+    assert res.price >= 0.0
+    assert res.price < 1e-6  # Black-Scholes value is ~1e-95
+    assert np.all(res.values >= 0.0)
+    assert np.all(np.diff(res.values) <= 1e-14)  # put nonincreasing in S
+    call = price_european_pde(mkt, 90.0, 1.0, 0.01, is_call=True, num_space=100, num_time=50, return_grid=True)
+    assert np.all(np.diff(call.values) >= -1e-14)
+    assert call.price == pytest.approx(bs_price(100.0, 90.0, 0.10, 0.0, 0.01, 1.0, True), rel=2e-3)
+    amer = price_american_put_pde(mkt, 90.0, 1.0, 0.01, num_space=100, num_time=50)
+    assert 0.0 <= amer < 1e-6
+
+
+def test_upwind_coefficients_are_m_matrix_and_consistent():
+    """Direct check of the coefficient rule: central where |mu| h <= 2a,
+    upwind elsewhere; off-diagonals >= 0 and row sum -r in both regimes."""
+    from localvol.pde import _coefficients
+
+    h, r, q = 0.01, 0.05, 0.0
+    sig = np.array([0.2, 0.01])           # first central, second upwind (mu h = 5e-4 > 2a = 1e-4)
+    lower, center, upper = _coefficients(sig, r, q, h)
+    a = 0.5 * sig**2
+    mu = r - q - a
+    np.testing.assert_allclose(lower[0], a[0] / h**2 - mu[0] / (2 * h))
+    np.testing.assert_allclose(upper[0], a[0] / h**2 + mu[0] / (2 * h))
+    np.testing.assert_allclose(lower[1], a[1] / h**2)                  # mu > 0: no lower upwind term
+    np.testing.assert_allclose(upper[1], a[1] / h**2 + mu[1] / h)
+    np.testing.assert_allclose(center[1], -2 * a[1] / h**2 - mu[1] / h - r)
+    assert np.all(lower >= 0.0) and np.all(upper >= 0.0)
+    np.testing.assert_allclose(lower + center + upper, -r, atol=1e-12)
+
+
+def test_pde_scalar_and_bad_callables():
+    """MIN-8 / MAJ-4: scalar-returning callables are broadcast; NaN/negative
+    output is rejected with ValueError, not an IndexError or a solver error."""
+    mkt = Market(100.0, 0.05, 0.0)
+    flat = price_european_pde(mkt, 100.0, 1.0, 0.2, num_space=100, num_time=50)
+    scal = price_european_pde(mkt, 100.0, 1.0, lambda k, t: 0.2, num_space=100, num_time=50)
+    assert scal == flat
+    with pytest.raises(ValueError, match="non-finite/negative"):
+        price_european_pde(mkt, 100.0, 1.0, lambda k, t: np.nan * k, num_space=100, num_time=50, sigma_ref=0.2)
+    with pytest.raises(ValueError, match="non-finite/negative"):
+        price_european_pde(mkt, 100.0, 1.0, lambda k, t: -0.2, num_space=100, num_time=50, sigma_ref=0.2)
+    with pytest.raises(ValueError, match="non-finite/negative"):
+        price_american_put_pde(mkt, 100.0, 1.0, lambda k, t: np.full_like(k, np.inf), num_space=100, num_time=50, sigma_ref=0.2)
+    with pytest.raises(ValueError, match="shape"):
+        price_european_pde(mkt, 100.0, 1.0, lambda k, t: np.zeros(7), num_space=100, num_time=50, sigma_ref=0.2)
+    with pytest.raises(ValueError, match="sigma_ref"):
+        price_european_pde(mkt, 100.0, 1.0, lambda k, t: 0.2, sigma_ref=-1.0)
+
+
+def test_psor_rejects_nan_tol_and_bad_iters():
+    """MIN-12: tol = NaN must be rejected eagerly, not spin every time step."""
+    mkt = Market(100.0, 0.05, 0.0)
+    with pytest.raises(ValueError, match="tol"):
+        price_american_put_pde(mkt, 100.0, 1.0, 0.2, tol=float("nan"))
+    with pytest.raises(ValueError, match="tol"):
+        price_american_put_pde(mkt, 100.0, 1.0, 0.2, tol=0.0)
+    with pytest.raises(ValueError, match="tol"):
+        price_american_put_pde(mkt, 100.0, 1.0, 0.2, max_iter=0)
+    with pytest.raises(ValueError, match="tol"):
+        price_american_put_pde(mkt, 100.0, 1.0, 0.2, tol=float("inf"))
+
+
+def test_pde_determinism():
+    mkt = Market(100.0, 0.03, 0.01)
+    a = price_european_pde(mkt, 105.0, 0.7, 0.23, num_space=120, num_time=60)
+    b = price_european_pde(mkt, 105.0, 0.7, 0.23, num_space=120, num_time=60)
+    assert a == b

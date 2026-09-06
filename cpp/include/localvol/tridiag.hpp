@@ -10,6 +10,10 @@
 /// The Thomas algorithm is Gaussian elimination without pivoting in O(n):
 /// it is stable for the diagonally-dominant systems produced by the
 /// Crank-Nicolson discretisation and the natural-spline moment equations.
+/// The CN systems are diagonally dominant only while both off-diagonals are
+/// non-negative, i.e. under the mesh Peclet condition |mu| h <= 2a for
+/// central differencing; the PDE switches nodes that violate it to upwind
+/// differencing (see pde.hpp) so this kernel never sees a non-M-matrix.
 /// No library banded solver is used anywhere in the pricing path.
 
 #include <vector>
