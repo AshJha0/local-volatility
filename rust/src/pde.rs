@@ -31,6 +31,19 @@
 //! `h = 2 W / M`.  `ln S0` is exactly the middle node, so the price is read
 //! off with no interpolation: `price = V[M/2]`.
 //!
+//! **Mesh Peclet condition and upwinding.**  Central differencing of the
+//! drift keeps the theta-scheme matrix an M-matrix (monotone, diagonally
+//! dominant) only while `|mu_i| h <= 2 a_i` at every node.  With a flat vol
+//! on the default grid this holds, but under *local* vol the width rule
+//! uses `sigma_ref` while each node uses its own `sigma_i` — a node floored
+//! at 1% by the Dupire clamp with a few percent of carry violates it.  At
+//! such nodes (and only there) the first derivative switches to first-order
+//! **upwind**: `lower_i = alpha_i + max(-mu_i, 0)/h`,
+//! `upper_i = alpha_i + max(mu_i, 0)/h`, `center_i = -2 alpha_i - |mu_i|/h
+//! - r`.  Off-diagonals stay non-negative, the row sum stays `-r`, and the
+//! scheme cannot produce spurious oscillations or negative prices; the cost
+//! is `O(|mu| h / 2)` numerical diffusion at those nodes.
+//!
 //! Boundary conditions are Dirichlet with discounted asymptotics.  The
 //! local-vol coefficient for the step from `tau` to `tau + dts` is frozen
 //! at the step midpoint `t_mid = T - tau - dts/2` and evaluated at forward
@@ -163,7 +176,9 @@ fn time_steps(expiry: f64, num_time: usize) -> Vec<(f64, f64)> {
     steps
 }
 
-/// Interior-node theta-scheme coefficients (`lower`, `center`, `upper`).
+/// Interior-node theta-scheme coefficients (`lower`, `center`, `upper`):
+/// central differences where `|mu| h <= 2a`, first-order upwind elsewhere
+/// (see the module docs); both branches have row sum `-r`.
 fn coefficients(
     sigma_nodes: &[f64],
     r: f64,
@@ -178,10 +193,16 @@ fn coefficients(
         let a = 0.5 * sigma_nodes[i] * sigma_nodes[i]; // diffusion
         let mu = (r - q) - a; // log-spot drift
         let alpha = a / (h * h);
-        let beta = mu / (2.0 * h);
-        lower[i] = alpha - beta; // coefficient of V_{i-1}
-        upper[i] = alpha + beta; // coefficient of V_{i+1}
-        center[i] = -2.0 * alpha - r; // coefficient of V_i
+        if mu.abs() * h <= 2.0 * a {
+            let beta = mu / (2.0 * h);
+            lower[i] = alpha - beta; // coefficient of V_{i-1}
+            upper[i] = alpha + beta; // coefficient of V_{i+1}
+            center[i] = -2.0 * alpha - r; // coefficient of V_i
+        } else {
+            lower[i] = alpha + (-mu).max(0.0) / h;
+            upper[i] = alpha + mu.max(0.0) / h;
+            center[i] = -2.0 * alpha - mu.abs() / h - r;
+        }
     }
     (lower, center, upper)
 }
@@ -360,7 +381,7 @@ pub fn price_european_pde_grid(
         let sigma_nodes = match vol {
             VolInput::Flat(s) => vec![*s; m - 1],
             VolInput::Local(_) => {
-                let lf = market.log_forward(t_mid);
+                let lf = market.log_forward(t_mid)?;
                 let ks: Vec<f64> = x[1..m].iter().map(|&xi| xi - lf).collect();
                 vol.sigmas(&ks, t_mid)?
             }
@@ -422,8 +443,12 @@ pub fn price_american_put_pde_grid(
     if !(psor.omega > 0.0 && psor.omega < 2.0) {
         return Err(invalid(format!("omega must lie in (0, 2), got {}", psor.omega)));
     }
-    if psor.tol <= 0.0 || psor.max_iter < 1 {
-        return Err(invalid("tol must be > 0 and max_iter >= 1"));
+    // `!(tol > 0)` also rejects NaN, which `tol <= 0` would let through.
+    if !(psor.tol.is_finite() && psor.tol > 0.0) || psor.max_iter < 1 {
+        return Err(invalid(format!(
+            "tol must be finite and > 0 and max_iter >= 1, got {}, {}",
+            psor.tol, psor.max_iter
+        )));
     }
     if strike <= 0.0 {
         return Err(invalid("American put requires strike > 0"));
@@ -464,7 +489,7 @@ pub fn price_american_put_pde_grid(
         let sigma_nodes = match vol {
             VolInput::Flat(s) => vec![*s; m - 1],
             VolInput::Local(_) => {
-                let lf = market.log_forward(t_mid);
+                let lf = market.log_forward(t_mid)?;
                 let ks: Vec<f64> = x[1..m].iter().map(|&xi| xi - lf).collect();
                 vol.sigmas(&ks, t_mid)?
             }

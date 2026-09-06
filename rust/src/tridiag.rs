@@ -5,9 +5,13 @@
 //! (length `n-1`).  The Thomas algorithm is Gaussian elimination without
 //! pivoting in O(n): it is stable for the diagonally-dominant systems
 //! produced by the Crank-Nicolson discretisation (the diagonal
-//! `1 + theta dt (2a/h^2 + r)` dominates the off-diagonals whenever the
-//! scheme's local Peclet condition `|mu| h <= 2 a` holds, which the PDE
-//! grids used here satisfy by construction).
+//! `1 + theta dt (2a/h^2 + r)` dominates the off-diagonals whenever both
+//! off-diagonals are non-negative).  Central differencing gives that only
+//! under the mesh Peclet condition `|mu| h <= 2 a`, which a flat vol on the
+//! default grid satisfies but a floored local vol with a few percent of
+//! carry does not; the PDE therefore switches those nodes to upwind
+//! differencing (see [`crate::pde`]), which restores non-negative
+//! off-diagonals and hence the diagonal dominance this kernel relies on.
 //!
 //! No library banded solver is used anywhere in the pricing path — this is
 //! the single linear-algebra kernel of the crate (also used for the cubic

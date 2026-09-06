@@ -1,6 +1,7 @@
 package com.quant.localvol;
 
-import java.util.Random;
+import java.util.random.RandomGenerator;
+import java.util.random.RandomGeneratorFactory;
 
 /**
  * Local-volatility Monte Carlo: log-Euler scheme with antithetic variates.
@@ -30,13 +31,37 @@ import java.util.Random;
  * (sigma_n^2 dt))} — the exact bridge crossing probability — removing the
  * O(sqrt(dt)) discrete-monitoring bias with no extra random numbers.
  *
- * <p><b>RNG</b>: {@code java.util.Random} Gaussians with a fixed seed. Per
- * the contract each language uses its own generator, so MC golden
- * comparisons are statistical (tolerances sized at 4 standard errors).
+ * <p><b>RNG</b>: {@code L64X128MixRandom} (LXM family, Java 17+; 128-bit
+ * state, far stronger than the 48-bit LCG of {@code java.util.Random})
+ * seeded from a fixed {@code long}, with the generator's own
+ * {@code nextGaussian}. Runs are deterministic for a fixed JDK. Per the
+ * contract each language uses its own generator, so MC golden comparisons
+ * are statistical (tolerances sized at 4 standard errors).
+ *
+ * <p>A user-supplied {@link LocalVolFn} is checked on every lookup: NaN,
+ * infinite or negative output throws {@link IllegalArgumentException}
+ * instead of propagating into the estimate ({@code sigma == 0} is allowed).
  */
 public final class MonteCarlo {
 
+    /** Name of the {@link RandomGenerator} algorithm used for all draws. */
+    public static final String RNG_ALGORITHM = "L64X128MixRandom";
+
     private MonteCarlo() {
+    }
+
+    private static RandomGenerator rng(long seed) {
+        return RandomGeneratorFactory.of(RNG_ALGORITHM).create(seed);
+    }
+
+    /** Look up the user function and reject NaN/inf/negative output eagerly. */
+    private static double checkedSigma(LocalVolFn vol, double k, double t) {
+        double sig = vol.vol(k, t);
+        if (!Double.isFinite(sig) || sig < 0.0) {
+            throw new IllegalArgumentException(
+                    "vol function returned non-finite/negative sigma at t=" + t + ": " + sig);
+        }
+        return sig;
     }
 
     /**
@@ -68,11 +93,17 @@ public final class MonteCarlo {
         if (!Double.isFinite(expiry) || expiry <= 0.0) {
             throw new IllegalArgumentException("expiry must be finite and > 0, got " + expiry);
         }
-        if (nPaths < 2) {
-            throw new IllegalArgumentException("n_paths must be >= 2, got " + nPaths);
-        }
-        if (antithetic && nPaths % 2 != 0) {
-            throw new IllegalArgumentException("antithetic sampling requires an even n_paths");
+        if (antithetic) {
+            if (nPaths % 2 != 0) {
+                throw new IllegalArgumentException("antithetic sampling requires an even n_paths");
+            }
+            if (nPaths < 4) {
+                throw new IllegalArgumentException("n_paths must be >= 4 with antithetic sampling "
+                        + "(at least two pair means are needed for a standard error), got " + nPaths);
+            }
+        } else if (nPaths < 2) {
+            throw new IllegalArgumentException("n_paths must be >= 2 (at least two samples are "
+                    + "needed for a standard error), got " + nPaths);
         }
         if (nSteps < 1) {
             throw new IllegalArgumentException("n_steps must be >= 1, got " + nSteps);
@@ -122,8 +153,8 @@ public final class MonteCarlo {
      * @param expiry     maturity in years ({@code > 0})
      * @param sigma      flat volatility ({@code > 0})
      * @param isCall     payoff type
-     * @param nPaths     number of paths (even when antithetic)
-     * @param nSteps     number of time steps
+     * @param nPaths     number of paths ({@code >= 4} and even when antithetic, else {@code >= 2})
+     * @param nSteps     number of time steps ({@code >= 1})
      * @param seed       RNG seed
      * @param antithetic use antithetic variates
      * @return price and standard error
@@ -163,7 +194,7 @@ public final class MonteCarlo {
     private static McResult europeanCore(Market market, double strike, double expiry,
                                          LocalVolFn vol, boolean isCall, int nPaths, int nSteps,
                                          long seed, boolean antithetic) {
-        Random rng = new Random(seed);
+        RandomGenerator rng = rng(seed);
         double dt = expiry / nSteps;
         double sq = Math.sqrt(dt);
         double driftRq = (market.rate() - market.dividend()) * dt;
@@ -183,12 +214,12 @@ public final class MonteCarlo {
                 z[p] = rng.nextGaussian();
             }
             for (int p = 0; p < nBase; p++) {
-                double sig = vol.vol(x[p] - lf, t);
+                double sig = checkedSigma(vol, x[p] - lf, t);
                 x[p] += driftRq - 0.5 * sig * sig * dt + sig * sq * z[p];
             }
             if (xa != null) {
                 for (int p = 0; p < nBase; p++) {
-                    double sig = vol.vol(xa[p] - lf, t);
+                    double sig = checkedSigma(vol, xa[p] - lf, t);
                     xa[p] += driftRq - 0.5 * sig * sig * dt - sig * sq * z[p];
                 }
             }
@@ -268,7 +299,7 @@ public final class MonteCarlo {
         if (market.spot() >= barrier) {
             return new McResult(0.0, 0.0); // born knocked out
         }
-        Random rng = new Random(seed);
+        RandomGenerator rng = rng(seed);
         double dt = expiry / nSteps;
         double sq = Math.sqrt(dt);
         double driftRq = (market.rate() - market.dividend()) * dt;
@@ -312,12 +343,13 @@ public final class MonteCarlo {
             double t = n * dt;
             double lf = market.logForward(t);
             for (int p = 0; p < nBase; p++) {
-                double sig = vol.vol(x[p] - lf, t);
+                double sig = checkedSigma(vol, x[p] - lf, t);
                 double xNew = x[p] + driftRq - 0.5 * sig * sig * dt + sign * sig * sq * zAll[n][p];
                 if (xNew >= b) {
                     weight[p] = 0.0;
                 } else if (brownianBridge && weight[p] > 0.0) {
-                    // P[bridge from x to xNew crosses b] for x, xNew < b.
+                    // P[bridge from x to xNew crosses b] for x, xNew < b
+                    // (sig == 0 gives exp(-inf) = 0: no crossing possible).
                     double pCross = Math.exp(-2.0 * (b - x[p]) * (b - xNew) / (sig * sig * dt));
                     weight[p] *= 1.0 - pCross;
                 }

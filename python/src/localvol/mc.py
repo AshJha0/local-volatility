@@ -74,17 +74,46 @@ def _validate_mc(
         raise ValueError(f"strike must be finite and >= 0, got {strike!r}")
     if not math.isfinite(expiry) or expiry <= 0.0:
         raise ValueError(f"expiry must be finite and > 0, got {expiry!r}")
-    if n_paths < 2:
-        raise ValueError(f"n_paths must be >= 2, got {n_paths!r}")
-    if antithetic and n_paths % 2 != 0:
-        raise ValueError("antithetic sampling requires an even n_paths")
+    if antithetic:
+        if n_paths % 2 != 0:
+            raise ValueError("antithetic sampling requires an even n_paths")
+        if n_paths < 4:
+            raise ValueError(
+                f"n_paths must be >= 4 with antithetic sampling (at least two pair "
+                f"means are needed for a standard error), got {n_paths!r}"
+            )
+    elif n_paths < 2:
+        raise ValueError(
+            f"n_paths must be >= 2 (at least two samples are needed for a standard "
+            f"error), got {n_paths!r}"
+        )
     if n_steps < 1:
         raise ValueError(f"n_steps must be >= 1, got {n_steps!r}")
 
 
 def _sigma_lookup(vol: VolInput):
+    """Wrap ``vol`` as a checked ``sigma(k_array, t) -> array`` callable.
+
+    A user callable is validated on every call: its output is broadcast to
+    the shape of ``k`` and must be finite and ``>= 0`` (a NaN/inf/negative
+    sigma would otherwise propagate silently into ``price``/``stderr``).
+    """
     if callable(vol):
-        return vol
+        user_fn = vol
+
+        def checked(k: NDArray[np.float64], t: float) -> NDArray[np.float64]:
+            sig = np.asarray(user_fn(k, t), dtype=np.float64)
+            try:
+                sig = np.broadcast_to(sig, k.shape)
+            except ValueError as exc:
+                raise ValueError(
+                    f"vol callable returned shape {sig.shape}, expected {k.shape} at t={t:g}"
+                ) from exc
+            if not (np.all(np.isfinite(sig)) and np.all(sig >= 0.0)):
+                raise ValueError(f"vol callable returned non-finite/negative sigma at t={t:g}")
+            return sig
+
+        return checked
     sigma = float(vol)
     if not math.isfinite(sigma) or sigma <= 0.0:
         raise ValueError(f"flat vol must be finite and > 0 for MC, got {sigma!r}")
@@ -198,10 +227,12 @@ def price_up_out_call_mc(
             weight[hit] = 0.0
             if brownian_bridge:
                 alive = ~hit & (weight > 0.0)
-                # P[bridge from x to x_new crosses b] for x, x_new < b.
-                p = np.exp(
-                    -2.0 * (b - x[alive]) * (b - x_new[alive]) / (sig[alive] ** 2 * dt)
-                )
+                # P[bridge from x to x_new crosses b] for x, x_new < b.  A
+                # zero step vol gives exp(-inf) = 0: no crossing possible.
+                with np.errstate(divide="ignore"):
+                    p = np.exp(
+                        -2.0 * (b - x[alive]) * (b - x_new[alive]) / (sig[alive] ** 2 * dt)
+                    )
                 weight[alive] *= 1.0 - p
             x = x_new
         payoff = weight * np.maximum(np.exp(x) - strike, 0.0)

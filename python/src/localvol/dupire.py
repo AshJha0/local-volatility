@@ -26,17 +26,39 @@ Numerics
 --------
 Derivatives are central finite differences applied to the interpolated
 surface with **fixed steps** ``DK = 1e-3`` (log-moneyness) and ``DT = 1e-4``
-(years); at ``T <= DT`` the time derivative switches to a forward difference
-so it never samples negative expiries.  These exact step sizes are part of
-the cross-language contract (see API_SPEC.md): with the interpolation scheme
-pinned down, ports reproduce the golden local-vol values to well under the
-1e-4 tolerance.
+(years); at ``0 < T <= DT`` the time derivative switches to a forward
+difference so it never samples negative expiries.  These exact step sizes
+are part of the cross-language contract (see API_SPEC.md): with the
+interpolation scheme pinned down, ports reproduce the golden local-vol
+values to well under the 1e-4 tolerance.
+
+**Stencil clamp at the quoted wings.**  The surface is flat in ``k`` beyond
+the last quoted strikes, so ``w`` is only C^0 there (a natural spline has
+``w'' = 0`` but ``w' != 0`` at the end node).  A central stencil straddling
+that kink would read a spurious ``d2w/dk2 ~ -w'/DK`` and cap the vol at
+500% *at the quoted wing*.  The query point is therefore clamped into
+``[k_min + DK, k_max - DK]`` before differencing (whenever the box is wider
+than ``2 DK``), and the clamped ``k`` is used in every term of the formula:
+local vol is constant in ``k`` beyond ``k_max - DK`` and continuous across
+the wing node.
+
+**Short-expiry limit.**  ``w(k, 0) = 0`` exactly, so the formula is
+undefined at ``T = 0``.  ``vol(k, 0)`` is defined as the ``T -> 0+`` limit
+(Berestycki, Busca, Florent 2002): with the short-end implied vol
+``s(k) = implied_vol(k, 0)``,
+
+    sigma_loc(k, 0) = s(k) / (1 - k s'(k) / s(k)),
+
+``s'`` by the same central ``DK`` difference on the clamped ``k``.  The
+``T > 0`` branch converges to this value as ``T -> 0`` (the surface uses
+flat forward variance below the first pillar), so the function is
+continuous at ``T = 0``.
 
 Robustness: the local vol is clamped to ``[FLOOR, CAP] = [1%, 500%]``.
 A clamp fires when the raw formula leaves that band or is undefined —
 numerator <= 0 (calendar arbitrage / flat forward variance) floors, and
-denominator <= 0 (butterfly arbitrage in the wings of an over-steep smile)
-caps.  Every clamp is counted in :attr:`DupireLocalVol.floor_count` /
+denominator <= 0 (butterfly arbitrage in an over-steep smile) caps.  Every
+clamp is counted in :attr:`DupireLocalVol.floor_count` /
 :attr:`DupireLocalVol.cap_count` so callers can *report* surface quality
 instead of crashing mid-pricing.
 """
@@ -81,6 +103,53 @@ class DupireLocalVol:
         self.floor_count = 0
         self.cap_count = 0
 
+    def _clamp_k(self, kq: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Clamp queries into ``[k_min + DK, k_max - DK]`` so that no central
+        stencil straddles the C^0 kink of the flat wing extrapolation (only
+        when the quoted box is wider than ``2 DK``)."""
+        kmin, kmax = self.surface.k_min, self.surface.k_max
+        if kmax - kmin > 2.0 * DK:
+            return np.clip(kq, kmin + DK, kmax - DK)
+        return kq
+
+    def _clamp_and_count(
+        self, num: NDArray[np.float64], denom: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        """Shared clamp policy: ``num <= 0`` floors, else ``denom <= 0`` caps,
+        else ``sqrt(num/denom)`` clipped into ``[FLOOR, CAP]``; every hit
+        counted.  Returns the clamped local *variance*."""
+        var = np.empty_like(num)
+        bad_num = num <= 0.0
+        bad_denom = denom <= 0.0
+        ok = ~(bad_denom | bad_num)
+        var[ok] = num[ok] / denom[ok]
+        var[bad_num] = FLOOR * FLOOR          # no forward variance -> floor
+        var[bad_denom & ~bad_num] = CAP * CAP  # butterfly arbitrage -> cap
+
+        vol = np.sqrt(var)
+        floors = int(np.count_nonzero(vol < FLOOR)) + int(np.count_nonzero(bad_num))
+        caps = int(np.count_nonzero(vol > CAP)) + int(np.count_nonzero(bad_denom & ~bad_num))
+        self.floor_count += floors
+        self.cap_count += caps
+        vol = np.clip(vol, FLOOR, CAP)
+        return vol * vol
+
+    def _short_time_variance(self, kq: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Berestycki-Busca-Florent ``T -> 0+`` limit
+        ``sigma_loc(k, 0) = s / (1 - k s'/s)`` with ``s = implied_vol(k, 0)``."""
+        srf = self.surface
+        s = np.asarray(srf.implied_vol(kq, 0.0), dtype=np.float64)
+        s_up = np.asarray(srf.implied_vol(kq + DK, 0.0), dtype=np.float64)
+        s_dn = np.asarray(srf.implied_vol(kq - DK, 0.0), dtype=np.float64)
+        dsdk = (s_up - s_dn) / (2.0 * DK)
+        ss = np.maximum(s, _W_EPS)  # guard s == 0 (spline overshoot to w <= 0)
+        denom = 1.0 - kq * dsdk / ss
+        # Same clamp policy as the T > 0 branch with num = s^2 (the short-end
+        # forward variance) and den = denom * |denom|, so that
+        # sqrt(num / den) = s / denom when denom > 0, s == 0 floors and
+        # denom <= 0 caps.
+        return self._clamp_and_count(s * s, denom * np.abs(denom))
+
     def local_variance(self, k: FloatOrArray, expiry: float) -> FloatOrArray:
         """Clamped local variance ``sigma_loc^2(k, T)``; see :meth:`vol`."""
         if not math.isfinite(expiry) or expiry < 0.0:
@@ -89,6 +158,10 @@ class DupireLocalVol:
         kq = np.atleast_1d(np.asarray(k, dtype=np.float64))
         if not np.all(np.isfinite(kq)):
             raise ValueError("k must be finite")
+        kq = self._clamp_k(kq)  # stencil never straddles the wing kink
+        if expiry == 0.0:
+            out = self._short_time_variance(kq)
+            return float(out[0]) if scalar else out
         srf = self.surface
 
         w = np.asarray(srf.total_variance(kq, expiry), dtype=np.float64)
@@ -111,22 +184,7 @@ class DupireLocalVol:
             + 0.25 * (-0.25 - 1.0 / ws + (kq * kq) / (ws * ws)) * dwdk * dwdk
             + 0.5 * d2wdk2
         )
-
-        var = np.empty_like(ws)
-        bad_denom = denom <= 0.0
-        bad_num = dwdt <= 0.0
-        ok = ~(bad_denom | bad_num)
-        var[ok] = dwdt[ok] / denom[ok]
-        var[bad_num] = FLOOR * FLOOR          # no forward variance -> floor
-        var[bad_denom & ~bad_num] = CAP * CAP  # butterfly-arb wing -> cap
-
-        vol = np.sqrt(var)
-        floors = int(np.count_nonzero(vol < FLOOR)) + int(np.count_nonzero(bad_num))
-        caps = int(np.count_nonzero(vol > CAP)) + int(np.count_nonzero(bad_denom & ~bad_num))
-        self.floor_count += floors
-        self.cap_count += caps
-        vol = np.clip(vol, FLOOR, CAP)
-        out = vol * vol
+        out = self._clamp_and_count(dwdt, denom)
         return float(out[0]) if scalar else out
 
     def vol(self, k: FloatOrArray, expiry: float) -> FloatOrArray:

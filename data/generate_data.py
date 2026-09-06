@@ -186,21 +186,42 @@ def main() -> None:
     # --------- 6-10: Dupire local vol at 5 interior points, bundled surface.
     # Reference market for the bundled-surface cases: S0=100, r=q=0, so the
     # forward is 100 and k = ln(K/100) maps to familiar strike labels.
+    # Linear-in-w time interpolation makes the forward variance dw/dT
+    # piecewise constant, so sigma_loc jumps at every pillar; the golden
+    # expiries therefore sit 1e-3 *off* the pillars (0.501, 1.001) so that
+    # the DT = 1e-4 central stencil never straddles a jump and a port that
+    # differentiates one-sidedly still reproduces the values.
     lv = DupireLocalVol(bundled)
     dupire_pts = [
-        ("dupire_bundled_k80_T05", 80.0, 0.5),
-        ("dupire_bundled_k95_T1", 95.0, 1.0),
-        ("dupire_bundled_k100_T1", 100.0, 1.0),
+        ("dupire_bundled_k80_T0501", 80.0, 0.501),
+        ("dupire_bundled_k95_T1001", 95.0, 1.001),
+        ("dupire_bundled_k100_T1001", 100.0, 1.001),
         ("dupire_bundled_k110_T15", 110.0, 1.5),
         ("dupire_bundled_k120_T075", 120.0, 0.75),
     ]
     lv.reset_counters()
     for name, strike, T in dupire_pts:
         k = math.log(strike / 100.0)
+        for pillar in bundled.expiries:
+            assert abs(T - pillar) > 5e-4, f"{name}: golden expiry {T} sits on pillar {pillar}"
         v = float(lv.vol(k, T))
         add(name, {"k": round(k, 12), "T": T}, {"local_vol": round(v, 10)}, 1e-4)
         print(f"golden {name}: k={k:+.6f} T={T} local_vol={v:.6f}")
     assert lv.floor_count == 0 and lv.cap_count == 0, "clamps fired on interior golden points"
+
+    # Validation sweep (not written): with the wing-clamped stencil no clamp
+    # may fire anywhere inside the quoted box, and the local vol must be
+    # continuous across the last quoted strike.
+    lv.reset_counters()
+    for T in [0.1, 0.5, 0.75, 1.0, 2.0, 3.0]:
+        lv.vol(np.arange(-0.5, 0.5 + 1e-9, 0.005), T)
+        for edge in (bundled.k_min, bundled.k_max):
+            jump = abs(float(lv.vol(edge - 1e-4, T)) - float(lv.vol(edge + 1e-4, T)))
+            assert jump < 1e-3, f"local vol discontinuous at k={edge}, T={T}: {jump}"
+    assert lv.floor_count == 0 and lv.cap_count == 0, (
+        f"clamps fired inside the quoted box: {lv.violation_report}"
+    )
+    print("validated: no Dupire clamps inside the quoted box; continuous at the wings")
 
     # ------------------- 11: local-vol PDE price on the bundled surface.
     mkt0 = Market(100.0, 0.0, 0.0)

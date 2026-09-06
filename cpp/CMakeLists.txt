@@ -31,6 +31,7 @@ target_compile_definitions(demo PRIVATE LOCALVOL_DATA_DIR="${LOCALVOL_DATA_DIR}"
 # ---- tests -----------------------------------------------------------------
 enable_testing()
 find_package(GTest REQUIRED)
+find_package(Threads REQUIRED)  # thread-safety test of the Dupire counters
 
 add_executable(localvol_tests
     tests/test_tridiag.cpp
@@ -39,9 +40,10 @@ add_executable(localvol_tests
     tests/test_dupire.cpp
     tests/test_pde.cpp
     tests/test_mc.cpp
+    tests/test_roundtrip.cpp
     tests/test_golden.cpp
 )
-target_link_libraries(localvol_tests PRIVATE localvol GTest::gtest GTest::gtest_main)
+target_link_libraries(localvol_tests PRIVATE localvol GTest::gtest GTest::gtest_main Threads::Threads)
 target_compile_definitions(localvol_tests PRIVATE LOCALVOL_DATA_DIR="${LOCALVOL_DATA_DIR}")
 
 include(GoogleTest)

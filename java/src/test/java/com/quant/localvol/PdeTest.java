@@ -187,4 +187,124 @@ public class PdeTest {
         assertThrows(IllegalArgumentException.class, // null vol function
                 () -> Pde.priceEuropean(mkt, 100.0, 1.0, (LocalVolFn) null, 0.2, true));
     }
+
+    @Test
+    public void psorNonConvergenceWarnsAndReturnsFinite() {
+        // max_iter = 1 cannot converge: a stderr warning per time step and a
+        // finite, non-negative price (report, don't crash).
+        Market mkt = new Market(100.0, 0.05, 0.0);
+        java.io.PrintStream old = System.err;
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        double price;
+        try {
+            System.setErr(new java.io.PrintStream(buf, true));
+            price = Pde.priceAmericanPut(mkt, 100.0, 1.0, 0.2, 100, 20, 6.0,
+                    Pde.DEFAULT_OMEGA, Pde.DEFAULT_TOL, 1);
+        } finally {
+            System.setErr(old);
+        }
+        assertTrue("warning emitted", buf.toString().contains("PSOR did not converge"));
+        assertTrue(Double.isFinite(price) && price >= 0.0);
+        assertEquals(6.4776, price, 1e-3);
+    }
+
+    @Test
+    public void americanPutDeepItmEqualsIntrinsic() {
+        double price = Pde.priceAmericanPut(new Market(50.0, 0.05, 0.0), 100.0, 1.0, 0.2, 100, 50, 6.0,
+                Pde.DEFAULT_OMEGA, Pde.DEFAULT_TOL, Pde.DEFAULT_MAX_ITER);
+        assertEquals(50.0, price, 1e-8);
+    }
+
+    @Test
+    public void americanPutNegativeRateEqualsEuropean() {
+        // r < 0, q = 0: early exercise is never optimal for a put.
+        Market mkt = new Market(100.0, -0.02, 0.0);
+        double eur = Pde.priceEuropean(mkt, 100.0, 1.0, 0.2, false, 100, 50, 6.0);
+        double ame = Pde.priceAmericanPut(mkt, 100.0, 1.0, 0.2, 100, 50, 6.0,
+                Pde.DEFAULT_OMEGA, Pde.DEFAULT_TOL, Pde.DEFAULT_MAX_ITER);
+        assertEquals(eur, ame, 1e-6);
+        assertTrue(ame >= eur - 1e-12);
+    }
+
+    @Test
+    public void localVolGridConvergence() {
+        // Observed order vs a 400x400 reference in [0.8, 2.5] under local vol.
+        DupireLocalVol lv = bundledLocalVol();
+        Market mkt = new Market(100.0, 0.0, 0.0);
+        double ref = Pde.priceEuropean(mkt, 100.0, 1.0, lv, 0.2, true, 400, 400, 6.0);
+        int[] ms = {50, 100, 200};
+        double[] errs = new double[3];
+        for (int i = 0; i < 3; i++) {
+            errs[i] = Math.abs(Pde.priceEuropean(mkt, 100.0, 1.0, lv, 0.2, true, ms[i], ms[i], 6.0) - ref);
+        }
+        for (int i = 0; i < 2; i++) {
+            double order = Math.log(errs[i] / errs[i + 1]) / Math.log(2.0);
+            assertTrue("order " + order + " errors " + java.util.Arrays.toString(errs),
+                    order >= 0.8 && order <= 2.5);
+        }
+    }
+
+    @Test
+    public void pecletViolationSwitchesToUpwindAndStaysMonotone() {
+        // MAJ-5: 1% vol with 10% carry violates |mu| h <= 2a on the default
+        // grid. Central differencing yields a negative put price (-2.95e-6)
+        // and grid values down to -0.084; upwinding keeps everything >= 0
+        // and monotone.
+        Market mkt = new Market(100.0, 0.10, 0.0);
+        Pde.Result put = Pde.europeanGrid(mkt, 90.0, 1.0, 0.01, false, 100, 50, 6.0);
+        assertTrue("put " + put.price(), put.price() >= 0.0 && put.price() < 1e-6); // BS ~1e-95
+        double[] v = put.values();
+        for (int i = 0; i < v.length; i++) {
+            assertTrue("node " + i, v[i] >= 0.0);
+            if (i > 0) {
+                assertTrue("node " + i, v[i] - v[i - 1] <= 1e-14); // nonincreasing in S
+            }
+        }
+        Pde.Result call = Pde.europeanGrid(mkt, 90.0, 1.0, 0.01, true, 100, 50, 6.0);
+        double[] c = call.values();
+        for (int i = 1; i < c.length; i++) {
+            assertTrue("node " + i, c[i] - c[i - 1] >= -1e-14);
+        }
+        double bs = BlackScholes.bsPrice(100.0, 90.0, 0.10, 0.0, 0.01, 1.0, true);
+        assertEquals(bs, call.price(), 2e-3 * bs);
+        double amer = Pde.priceAmericanPut(mkt, 90.0, 1.0, 0.01, 100, 50, 6.0,
+                Pde.DEFAULT_OMEGA, Pde.DEFAULT_TOL, Pde.DEFAULT_MAX_ITER);
+        assertTrue("American " + amer, amer >= 0.0 && amer < 1e-6);
+    }
+
+    @Test
+    public void rejectsBadVolFunctionsAndNanTol() {
+        // MAJ-4 / MIN-12
+        Market mkt = new Market(100.0, 0.05, 0.0);
+        LocalVolFn nan = (k, t) -> Double.NaN;
+        LocalVolFn neg = (k, t) -> -0.2;
+        LocalVolFn inf = (k, t) -> Double.POSITIVE_INFINITY;
+        assertThrows(IllegalArgumentException.class,
+                () -> Pde.priceEuropean(mkt, 100.0, 1.0, nan, 0.2, true, 100, 50, 6.0));
+        assertThrows(IllegalArgumentException.class,
+                () -> Pde.priceEuropean(mkt, 100.0, 1.0, neg, 0.2, true, 100, 50, 6.0));
+        assertThrows(IllegalArgumentException.class,
+                () -> Pde.priceAmericanPut(mkt, 100.0, 1.0, inf, 0.2, 100, 50, 6.0,
+                        Pde.DEFAULT_OMEGA, Pde.DEFAULT_TOL, Pde.DEFAULT_MAX_ITER));
+        assertThrows(IllegalArgumentException.class, // default sigmaRef from a NaN function
+                () -> Pde.priceEuropean(mkt, 100.0, 1.0, nan, Double.NaN, true, 100, 50, 6.0));
+        assertThrows(IllegalArgumentException.class,
+                () -> Pde.priceEuropean(mkt, 100.0, 1.0, (k, t) -> 0.2, -1.0, true, 100, 50, 6.0));
+        // a constant function equals the flat-vol path exactly
+        assertEquals(Pde.priceEuropean(mkt, 100.0, 1.0, 0.2, true, 100, 50, 6.0),
+                Pde.priceEuropean(mkt, 100.0, 1.0, (k, t) -> 0.2, 0.2, true, 100, 50, 6.0), 0.0);
+        assertThrows(IllegalArgumentException.class,
+                () -> Pde.priceAmericanPut(mkt, 100.0, 1.0, 0.2, 100, 50, 6.0, 1.5, Double.NaN, 100));
+        assertThrows(IllegalArgumentException.class,
+                () -> Pde.priceAmericanPut(mkt, 100.0, 1.0, 0.2, 100, 50, 6.0, 1.5, Double.POSITIVE_INFINITY, 100));
+        assertThrows(IllegalArgumentException.class,
+                () -> Pde.priceAmericanPut(mkt, 100.0, 1.0, 0.2, 100, 50, 6.0, 1.5, 1e-8, 0));
+    }
+
+    @Test
+    public void pdeIsDeterministic() {
+        Market mkt = new Market(100.0, 0.03, 0.01);
+        assertEquals(Pde.priceEuropean(mkt, 105.0, 0.7, 0.23, true, 120, 60, 6.0),
+                Pde.priceEuropean(mkt, 105.0, 0.7, 0.23, true, 120, 60, 6.0), 0.0);
+    }
 }

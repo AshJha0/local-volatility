@@ -146,7 +146,7 @@ denominator is $1$, so $\sigma_{\mathrm{loc}} \equiv \sigma$. The project's
 test of the surface interpolation, the finite differences and the formula in
 one shot.
 
-### 2.3 Worked example (matches golden `dupire_bundled_k100_T1`)
+### 2.3 Worked example (ATM, $T = 1$; golden `dupire_bundled_k100_T1001`)
 
 The bundled surface is an SSVI family with $\theta_T = 0.04\,T$,
 $\rho = -0.5$, $\eta = 0.7$, $\gamma = 0.5$; at the money it has
@@ -163,12 +163,20 @@ $\Delta k = 10^{-3}$, $\Delta T = 10^{-4}$:
 | denominator $g$ | $1.0582450$ |
 | $\sigma_{\mathrm{loc}} = \sqrt{0.04/1.05825}$ | $\mathbf{0.19441818}$ |
 
-Golden value: `0.1944181803`. Notice $\sigma_{\mathrm{loc}}(0, 1) < 
-\sigma_{\mathrm{imp}}(0, 1) = 0.20$ even though ATM total variance grows
-exactly like a 20%-vol process: with a negative skew the denominator exceeds
-1 at $k=0$, i.e. the implied density piles extra mass there. Local vol is a
-*redistribution* of the implied variance across the $(k, T)$ plane, not a
-relabeling.
+The golden case is evaluated at $T = 1.001$ rather than exactly on the
+pillar (value `0.1944178773`; the difference from the $T = 1$ number above
+is $3 \times 10^{-7}$ because ATM total variance is linear in $T$). The
+reason is §3: linear-in-$w$ time interpolation makes $\partial w/\partial T$
+piecewise constant, so local vol *jumps* at every pillar — at $k = \ln 0.8$
+it reads $0.3054 \mid 0.2985 \mid 0.2914$ across $T = 0.5 \pm 3\times10^{-4}$
+— and a value sampled exactly on the pillar is the average of two one-sided
+limits, which a port that differentiates one-sidedly would not reproduce.
+
+Notice $\sigma_{\mathrm{loc}}(0, 1) < \sigma_{\mathrm{imp}}(0, 1) = 0.20$
+even though ATM total variance grows exactly like a 20%-vol process: with a
+negative skew the denominator exceeds 1 at $k=0$, i.e. the implied density
+piles extra mass there. Local vol is a *redistribution* of the implied
+variance across the $(k, T)$ plane, not a relabeling.
 
 **The "two times" rule.** Expanding the formula for small $T$ and gentle
 skew gives the classic result that the local-vol skew is about **twice** the
@@ -179,6 +187,43 @@ along the path from spot to strike, so local vol must fall twice as fast for
 the average to fall as observed). On the bundled surface at $T = 1$ the
 measured ratio is $1.68$ — the rule is exact only in the short-expiry,
 linear-skew limit; curvature and maturity erode it.
+
+### 2.4 The short-expiry limit ($T \to 0$)
+
+At $T = 0$ the surface has $w = 0$ and the formula reads $0/0$. The limit is
+nevertheless finite and explicit. Write $w(k, T) = s(k)^2 T$ for small $T$
+(flat forward variance below the first pillar, which is exactly the
+project's extrapolation rule) with $s(k) = \sigma_{\mathrm{imp}}(k, 0)$.
+Then $\partial_T w = s^2$, $\partial_k w = 2 s s' T$,
+$\partial_{kk} w = 2 (s'^2 + s s'') T$, and in the denominator
+
+$$
+\frac{k}{w}\,\partial_k w = \frac{2 k s'}{s}, \qquad
+\frac{1}{w}(\partial_k w)^2 = 4 s'^2 T \to 0, \qquad
+\frac{k^2}{w^2}(\partial_k w)^2 = \frac{4 k^2 s'^2}{s^2},
+$$
+
+while $\tfrac{1}{2}\partial_{kk} w \to 0$. The denominator therefore tends to
+$1 - 2 k s'/s + k^2 s'^2/s^2 = (1 - k s'/s)^2$, and
+
+$$
+\sigma_{\mathrm{loc}}(k, 0) = \frac{s(k)}{1 - k\, s'(k)/s(k)}
+= \frac{\sigma_{\mathrm{imp}}}{1 - k\, \partial_k \ln \sigma_{\mathrm{imp}}}
+$$
+
+— the Berestycki–Busca–Florent (2002) result, whose inverse form
+"$1/\sigma_{\mathrm{imp}}(k,0)$ is the harmonic mean of $1/\sigma_{\mathrm{loc}}$
+between $0$ and $k$" is the rigorous version of the "two times" rule. The
+code uses this formula *verbatim* for `vol(k, 0)` (with $s'$ by the same
+central $\Delta k$ difference) so that the local-vol surface is continuous
+at $T = 0$; on the bundled surface `vol(-0.3, 0) = 0.4524`, which the
+$T > 0$ branch approaches as $T \to 0$ (an earlier revision returned the
+*implied* vol $0.309$ there — a 45% error for any user dumping a
+spot–vol grid at $t = 0$). Two consequences worth knowing: the denominator
+$1 - k s'/s$ is the intercept at $k = 0$ of the tangent to $s$ at $k$, so a
+convex smile can never make it negative, while a strongly convex parabola
+such as $s = 0.05 + 4k^2$ does at $|k| = 0.5$ — the `T = 0` branch then caps
+and counts, exactly like the $T > 0$ branch.
 
 ---
 
@@ -196,20 +241,33 @@ artifacts. Surface construction *is* the hard part of local vol in practice.
 * **Natural cubic spline in $k$ per expiry.** Dupire needs
   $\partial^2 w/\partial k^2$, so the interpolant must be $C^2$; a cubic
   spline is the simplest $C^2$ interpolant fully determined by the nodes.
-  "Natural" boundary conditions ($w'' = 0$ at the end nodes) blend smoothly
-  into the flat wings. The spline's tridiagonal moment system is solved with
-  the same Thomas kernel the PDE uses, so all four language ports reproduce
-  the surface bit-comparably. Beware: splines can *overshoot* on
-  ragged data, manufacturing spurious convexity — acceptable here because
-  the bundled data is smooth by construction; on real quotes desks fit a
-  parametric form (SVI/SSVI) per slice instead, precisely to control this.
+  "Natural" boundary conditions set $w'' = 0$ at the end nodes — but
+  *not* $w' = 0$, so the transition into the flat wings is only $C^0$: a
+  genuine kink in slope at the last quoted strike (see the extrapolation
+  bullet). The spline's tridiagonal moment system is solved with the same
+  Thomas kernel the PDE uses, so all four language ports reproduce the
+  surface bit-comparably. Beware: splines can *overshoot* on ragged data,
+  manufacturing spurious convexity or even $w < 0$ — the surface scans
+  every node interval at build time and reports such dips in
+  `negative_w_count`; acceptable here because the bundled data is smooth by
+  construction, but on real quotes desks fit a parametric form (SVI/SSVI)
+  per slice instead, precisely to control this.
 * **Linear-in-$w$ in $T$ between pillars** (see above), giving a piecewise
   constant forward variance $\partial w/\partial T$ between pillars.
 * **Extrapolation** — always a modeling *choice*, never data:
   * $k$ beyond the quoted wings: clamp $k$ (flat total variance ⇒ flat vol
-    wings). Simple and safe-ish, but the kink at the boundary makes the
-    Dupire denominator misbehave just outside — the source of the cap-clamp
-    counts in the demo.
+    wings). Simple and safe-ish, but $w$ is only $C^0$ at the boundary. A
+    central finite-difference stencil that straddles that kink reads
+    $\partial_{kk} w \approx -w'(k_{\max})/\Delta k \approx -50$, the
+    denominator turns negative and the vol is capped at 500% — **at the
+    quoted wing**, 2.5 standard deviations from ATM at $T = 1$, well inside
+    the PDE grid. The fix is to clamp the *query point* into
+    $[k_{\min} + \Delta k,\; k_{\max} - \Delta k]$ before differencing and
+    to use the clamped $k$ in every term: local vol is then constant in $k$
+    beyond $k_{\max} - \Delta k$, continuous across the wing, and no clamp
+    fires anywhere on the bundled surface. Before this clamp the demo's
+    round-trip error was 16.4 bp, about 85% of it caused by those spikes;
+    after it, 2.7 bp.
   * $T$ below the first pillar: $w(k, T) = w(k, T_1)\, T / T_1$ — flat
     forward variance, i.e. constant implied vol down to $T = 0$.
   * $T$ beyond the last pillar: continue the last interval's slope in $w$,
@@ -296,7 +354,12 @@ stiff modes; because only an $O(\Delta\tau)$-long initial segment is
 sub-second-order, the scheme's global second-order accuracy survives. The
 test suite checks both effects: gamma near the strike is non-oscillatory,
 and the observed convergence order on grid-halving lies in $[1.5, 2.5]$
-(measured $\approx 2$).
+(measured $\approx 2$). A literature note: Giles and Carter (2006) show
+that *four* backward-Euler half-steps (two $\Delta\tau$ intervals) are
+needed for delta and gamma at the kink to converge at second order as well;
+with the two used here the price is second order but the Greeks retain an
+$O(\Delta\tau)$ component. This is a documented choice — the goldens pin
+prices, not Greeks — and the schedule is a one-line change in each port.
 
 ### 4.4 Boundary conditions and the linear solve
 
@@ -305,11 +368,27 @@ call is worthless at $x_0$ and worth
 $S_M e^{-q\tau} - K e^{-r\tau}$ (floored at 0) at $x_M$; mirrored for puts.
 The boundary values are folded into the first/last rows of the right-hand
 side, and each step is one tridiagonal solve by the **Thomas algorithm**
-(Gaussian elimination without pivoting, $O(M)$) — safe here because the CN
-matrices are diagonally dominant whenever the mesh Péclet condition
-$|\mu| h \le 2a$ holds, which the grid rule guarantees by construction. No
-library banded solver appears in the pricing path in any language; SciPy /
-Eigen are used only as independent cross-checks inside tests.
+(Gaussian elimination without pivoting, $O(M)$) — safe because the
+matrices are diagonally dominant M-matrices whenever the mesh Péclet
+condition $|\mu_i| h \le 2 a_i$ holds at every node. That is *not*
+automatic: the width rule uses $\sigma_{\mathrm{ref}}$ while each node uses
+its own $\sigma_i$, so a node floored at 1% by the Dupire clamp with a 1–5%
+carry violates it (so does a 1% flat vol with a 10% carry). With central
+differencing the lower coefficient $\alpha_i - \beta_i$ then turns negative
+and the scheme loses monotonicity — a measured example: a 1%-vol put with
+$r = 10\%$ on a $100\times50$ grid comes out at $-3\times10^{-6}$ with grid
+values down to $-0.08$. The code therefore switches, node by node, to
+first-order **upwind** differencing of the drift wherever the condition
+fails ($\text{lower}_i = \alpha_i + \max(-\mu_i, 0)/h$,
+$\text{upper}_i = \alpha_i + \max(\mu_i, 0)/h$,
+$\text{center}_i = -2\alpha_i - |\mu_i|/h - r$): both off-diagonals stay
+non-negative, the row sum stays $-r$, prices stay non-negative and
+monotone, at the price of $O(|\mu| h/2)$ numerical diffusion at those (by
+construction already pathological) nodes. Nodes that satisfy the condition
+are untouched, so flat-vol results on the default grids are bit-identical
+to plain central differencing. No library banded solver appears in the
+pricing path in any language; SciPy / Eigen are used only as independent
+cross-checks inside tests.
 
 Under local vol, the coefficient $\sigma_i$ for the step from $\tau$ to
 $\tau + \Delta\tau_s$ is frozen at the step's **midpoint calendar time** and
@@ -459,11 +538,14 @@ Local vol matches today's vanilla surface *perfectly* and today's smile
    Always differentiate a *smoothed* (ideally parametric, arbitrage-checked)
    surface — never raw quotes.
 2. **Wing extrapolation artifacts.** Flat-$k$ extrapolation creates a
-   curvature kink at the last quoted strike; the Dupire denominator can go
-   negative just outside, hence the cap clamps in the demo (278 hits, all in
-   the far grid wings). Watch the counters — dozens of clamps in the far
-   wings are cosmetic; clamps *in the interior* mean your surface has real
-   arbitrage.
+   slope kink at the last quoted strike. A finite-difference stencil that
+   straddles it manufactures a huge negative curvature and caps the local
+   vol at 500% *at the quoted wing* — not "far out in the grid": on the
+   bundled surface that is 2.5 sd from ATM at $T = 1$ and 1.8 sd at
+   $T = 2$, and it cost 13 of the demo's former 16 bp. Clamp the stencil
+   inside the quoted box (as this project now does) and the counters read
+   zero; after that, *any* clamp on a smooth surface means the input has
+   real butterfly or calendar arbitrage.
 3. **Vol-interpolation in the wrong variable.** Linear-in-vol time
    interpolation can manufacture calendar arbitrage between pillars even
    when the pillars themselves are clean. Interpolate total variance.
@@ -475,7 +557,9 @@ Local vol matches today's vanilla surface *perfectly* and today's smile
 6. **MC vol lookup coordinates.** The surface is in *forward*
    log-moneyness: the lookup is $k = X_n - \ln F(t_n)$, not
    $X_n - \ln S_0$. Getting this wrong shows up only with nonzero carry —
-   test with $r \ne q$.
+   test with $r \ne q$ (the suites do: $r = 5\%, q = 2\%$ and an FX case
+   with a negative foreign rate; the $\ln S_0$ bug lands 4–5 standard errors
+   from the PDE).
 7. **Antithetic standard errors.** Use pair means. Raw-path standard errors
    are biased high (the test suite would catch the resulting inconsistency).
 8. **Statistical golden tests.** Cross-language MC cannot match
@@ -489,6 +573,50 @@ Local vol matches today's vanilla surface *perfectly* and today's smile
     good default on these grids, but PSOR convergence degrades on very fine
     grids — monitor the non-convergence warnings before trusting American
     prices from unusual grid settings.
+11. **The $T = 0$ slice.** $w(k, 0) = 0$ makes the formula $0/0$; returning
+    the implied vol there (as one might by reflex) is wrong off-ATM by
+    exactly the factor $1 - k\,\partial_k \ln\sigma_{\mathrm{imp}}$ (§2.4).
+    Define the slice as the short-time limit and test continuity against
+    $T = 10^{-6}$.
+12. **Silent NaN.** A user vol callable that returns NaN, $\infty$ or a
+    negative number must be rejected at the lookup, not discovered as a NaN
+    price or a mysterious solver failure two layers up. Same for the
+    antithetic standard error with a single pair ($0/0$): validate
+    `n_paths` before simulating.
+
+### 7.1 How a desk would use this
+
+A realistic workflow around this code base, and where its boundaries lie:
+
+1. **Quotes → surface.** Collect vanilla quotes per expiry (equity:
+   strike/expiry grids; FX: ATM / 25Δ risk-reversal / 25Δ butterfly
+   converted to strikes under the correct delta convention), fit an
+   arbitrage-free parametric slice (SVI/SSVI) per expiry, and *sample* the
+   fit onto a rectangular $(T, k)$ grid in forward log-moneyness — exactly
+   the format of `data/implied_surface.csv`. Do not feed raw quotes to the
+   spline. Convert dates to year fractions with one convention and use the
+   same one for the pricer inputs; the library carries no calendar.
+2. **Build and inspect.** Load the CSV, then read `calendar_violations`
+   and `negative_w_count`. Both should be zero; if not, go back to the fit.
+   Build `DupireLocalVol` once per surface and share it (it is immutable and
+   its counters are thread-safe), reset the counters, and run a coarse
+   $(k, t)$ sweep to confirm the floor/cap counters stay at zero *inside the
+   quoted box* — a non-zero count there is butterfly/calendar arbitrage in
+   the input, not a numerical artifact.
+3. **Reprice the inputs (round trip).** Before pricing anything exotic,
+   reprice the quoted vanillas by PDE and invert: the demo's grid should
+   come back within a few basis points (2.7 bp here). This is the model's
+   own consistency check and the cheapest way to catch a bad slice fit.
+4. **Price.** Europeans and American puts by PDE (a few ms each natively),
+   barriers by MC with the bridge correction; read the clamp counters again
+   afterwards. For a strike grid, price in parallel on the shared object.
+5. **Know what you are not getting.** No Greeks beyond the value grid
+   (bump-and-reprice with a *re-derived* local vol is the non-trivial
+   part), no discrete dividends or borrow curves, no stochastic component
+   — forward-start and cliquet-style payoffs are mispriced by construction
+   (§6), and barrier prices sit at the pure-local-vol end of the LSV range.
+   Local vol here is the calibration target and reference case, not the
+   final exotic model.
 
 ---
 
@@ -568,13 +696,18 @@ Penalty/operator-splitting methods are one solve per step and vectorize
 better, but introduce a penalty parameter that trades accuracy against
 conditioning. On 200-node teaching grids PSOR's transparency wins.
 
-**Q10. Your Dupire cap-counter reports 278 hits — do you ship the surface?**
-Look at *where* they fire. Here they all come from PDE grid nodes 4–6
-standard deviations out, beyond the quoted wings, where flat-$k$
-extrapolation kinks the curvature — cosmetic, and the interior round-trip
-error is 16 bp. If clamps fired at quoted interior strikes, the surface
-would carry genuine butterfly/calendar arbitrage and must be re-fit, not
-shipped.
+**Q10. Your Dupire cap-counter reports a few hundred hits on a smooth
+surface — do you ship it?**
+First find *where* they fire, because "far wings, cosmetic" is a tempting
+and often wrong diagnosis. In an earlier revision of this very project the
+hits were assumed to come from PDE nodes 4–6 standard deviations out, but
+they actually fired *at the last quoted strike* (2.5 sd from ATM), where
+the flat-wing extrapolation kinks $w$ and a straddling stencil turns the
+denominator negative — and they accounted for 13 of the 16 bp round-trip
+error. With the stencil clamped inside the quoted box the counters read
+zero on a smooth surface, so any remaining clamp means genuine
+butterfly/calendar arbitrage in the input: re-fit the slice, do not ship
+the number.
 
 ---
 
@@ -589,8 +722,14 @@ shipped.
   dynamics.
 * J. Gatheral, A. Jacquier, *Arbitrage-free SVI volatility surfaces*,
   Quantitative Finance, 2014 — the SSVI family generating the bundled data.
+* H. Berestycki, J. Busca, I. Florent, *Asymptotics and calibration of
+  local volatility models*, Quantitative Finance, 2002 — the $T \to 0$
+  limit of local vol used for the $T = 0$ slice (§2.4).
 * R. Rannacher, *Finite element solution of diffusion problems with
   irregular data*, Numerische Mathematik, 1984 — the smoothing start.
+* M. B. Giles, R. Carter, *Convergence analysis of Crank–Nicolson and
+  Rannacher time-marching*, Journal of Computational Finance, 2006 — why
+  four implicit half-steps are needed for second-order Greeks (§4.3).
 * D. Tavella, C. Randall, *Pricing Financial Instruments: The Finite
   Difference Method*, Wiley, 2000 — grids, boundaries, American options.
 * P. Glasserman, *Monte Carlo Methods in Financial Engineering*, Springer,

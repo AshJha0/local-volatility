@@ -12,6 +12,21 @@ discretised on a **uniform** x-grid with central differences and marched in
 Crank-Nicolson).  Tridiagonal systems are solved with the native Thomas
 kernel (:mod:`localvol.tridiag`).
 
+Mesh Peclet condition and upwinding
+-----------------------------------
+Central differencing of the drift term keeps the theta-scheme matrix an
+M-matrix (monotone, diagonally dominant) only while ``|mu_i| h <= 2 a_i``
+at every node.  With a flat vol on the default grid this always holds, but
+under *local* vol the width rule uses ``sigma_ref`` while each node uses its
+own ``sigma_i`` — a node floored at 1% by the Dupire clamp with a 1-5% carry
+violates it.  At such nodes (and only there) the first derivative switches
+to first-order **upwind**: ``lower_i = alpha_i + max(-mu_i, 0)/h``,
+``upper_i = alpha_i + max(mu_i, 0)/h``, ``center_i = -2 alpha_i - |mu_i|/h
+- r``.  Off-diagonals then stay non-negative, the row sum stays ``-r``, and
+the scheme cannot produce the spurious oscillations of a non-monotone
+matrix.  The switch is exact-arithmetic identical to central differencing
+whenever the condition holds, so flat-vol results are unaffected.
+
 Why Rannacher?
 --------------
 Crank-Nicolson is unconditionally *stable* but only neutrally damped: its
@@ -110,20 +125,66 @@ def _validate(
         raise ValueError(f"nsd must be finite and > 0, got {nsd!r}")
 
 
+def _checked_vol_fn(vol_fn: Callable) -> Callable[[NDArray[np.float64], float], NDArray[np.float64]]:
+    """Wrap a user ``sigma(k_array, t)`` callable: broadcast a scalar result
+    to the node shape and reject non-finite / negative output eagerly (a bad
+    coefficient would otherwise surface as an opaque Thomas-solver error or,
+    for a negative sigma, silently enter the scheme squared)."""
+
+    def checked(k: NDArray[np.float64], t: float) -> NDArray[np.float64]:
+        sig = np.asarray(vol_fn(k, t), dtype=np.float64)
+        try:
+            sig = np.broadcast_to(sig, k.shape)
+        except ValueError as exc:
+            raise ValueError(
+                f"vol callable returned shape {sig.shape}, expected {k.shape} at t={t:g}"
+            ) from exc
+        if not (np.all(np.isfinite(sig)) and np.all(sig >= 0.0)):
+            raise ValueError(f"vol callable returned non-finite/negative sigma at t={t:g}")
+        return sig
+
+    return checked
+
+
 def _resolve_vol(
     vol: VolInput, expiry: float, sigma_ref: Optional[float]
 ) -> tuple[Optional[float], Optional[Callable], float]:
-    """Return (flat_sigma or None, callable or None, sigma_ref)."""
+    """Return (flat_sigma or None, checked callable or None, sigma_ref)."""
     if callable(vol):
+        fn = _checked_vol_fn(vol)
         if sigma_ref is None:
-            sigma_ref = float(np.asarray(vol(np.array([0.0]), expiry))[0])
+            sigma_ref = float(fn(np.array([0.0]), expiry)[0])
         if not math.isfinite(sigma_ref) or sigma_ref <= 0.0:
             raise ValueError(f"sigma_ref must be finite and > 0, got {sigma_ref!r}")
-        return None, vol, sigma_ref
+        return None, fn, sigma_ref
     sigma = float(vol)
     if not math.isfinite(sigma) or sigma < 0.0:
         raise ValueError(f"flat vol must be finite and >= 0, got {sigma!r}")
     return sigma, None, sigma if sigma > 0.0 else 1.0
+
+
+def _coefficients(
+    sigma_nodes: NDArray[np.float64], r: float, q: float, h: float
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Interior-node coefficients ``(lower, center, upper)`` of the spatial
+    operator ``L``: ``(L V)_i = lower_i V_{i-1} + center_i V_i + upper_i V_{i+1}``.
+
+    Central differences for the first derivative wherever the mesh Peclet
+    condition ``|mu_i| h <= 2 a_i`` holds; where it fails (floored local
+    vol with strong carry) the node switches to first-order **upwind** so
+    that both off-diagonals stay ``>= 0`` and the theta-scheme matrix keeps
+    its M-matrix / monotonicity property.  Both branches have row sum ``-r``.
+    """
+    a = 0.5 * sigma_nodes * sigma_nodes            # diffusion, interior nodes
+    mu = (r - q) - a                               # log-spot drift
+    alpha = a / (h * h)
+    beta = mu / (2.0 * h)
+
+    central = np.abs(mu) * h <= 2.0 * a
+    lower = np.where(central, alpha - beta, alpha + np.maximum(-mu, 0.0) / h)
+    upper = np.where(central, alpha + beta, alpha + np.maximum(mu, 0.0) / h)
+    center = np.where(central, -2.0 * alpha - r, -2.0 * alpha - np.abs(mu) / h - r)
+    return lower, center, upper
 
 
 def _theta_step(
@@ -142,14 +203,7 @@ def _theta_step(
     ``v`` is the level at the current tau (boundaries included);
     ``v0_new``/``vm_new`` are the Dirichlet values at the new tau level.
     """
-    a = 0.5 * sigma_nodes * sigma_nodes            # diffusion, interior nodes
-    mu = (r - q) - a                               # log-spot drift
-    alpha = a / (h * h)
-    beta = mu / (2.0 * h)
-
-    lower = alpha - beta                           # coefficient of V_{i-1}
-    upper = alpha + beta                           # coefficient of V_{i+1}
-    center = -2.0 * alpha - r                      # coefficient of V_i
+    lower, center, upper = _coefficients(sigma_nodes, r, q, h)
 
     vi = v[1:-1]
     lv = lower * v[:-2] + center * vi + upper * v[2:]
@@ -185,13 +239,7 @@ def _psor_step(
     max_iter: int,
 ) -> NDArray[np.float64]:
     """One theta-scheme step solved as an LCP by projected SOR."""
-    a = 0.5 * sigma_nodes * sigma_nodes
-    mu = (r - q) - a
-    alpha = a / (h * h)
-    beta = mu / (2.0 * h)
-    lower = alpha - beta
-    upper = alpha + beta
-    center = -2.0 * alpha - r
+    lower, center, upper = _coefficients(sigma_nodes, r, q, h)
 
     vi = v[1:-1]
     lv = lower * v[:-2] + center * vi + upper * v[2:]
@@ -363,8 +411,9 @@ def price_american_put_pde(
     _validate(market, strike, expiry, num_space, num_time, nsd)
     if not (0.0 < omega < 2.0):
         raise ValueError(f"omega must lie in (0, 2), got {omega!r}")
-    if tol <= 0.0 or max_iter < 1:
-        raise ValueError("tol must be > 0 and max_iter >= 1")
+    # `not (tol > 0)` also rejects NaN, which `tol <= 0` would let through.
+    if not (math.isfinite(tol) and tol > 0.0) or max_iter < 1:
+        raise ValueError(f"tol must be finite and > 0 and max_iter >= 1, got {tol!r}, {max_iter!r}")
     if strike <= 0.0:
         raise ValueError("American put requires strike > 0")
     if expiry == 0.0:

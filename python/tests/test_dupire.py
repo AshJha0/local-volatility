@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -94,3 +96,105 @@ def test_validation():
         lv.vol(0.0, -1.0)
     with pytest.raises(ValueError):
         lv.vol(float("inf"), 1.0)
+
+
+def test_no_clamp_inside_quoted_box_and_continuous_at_wings(bundled_surface):
+    """CRIT-1 regression: the wing-clamped stencil must never cap inside the
+    quoted box, and local vol must be continuous across the last quoted
+    strike (before the fix vol(0.4995..0.5005, 1) was capped at 500%)."""
+    lv = DupireLocalVol(bundled_surface)
+    ks = np.arange(-0.5, 0.5 + 1e-9, 0.005)
+    for t in [0.1, 0.5, 0.75, 1.0, 2.0, 3.0]:
+        vols = np.asarray(lv.vol(ks, t))
+        assert np.all((vols > FLOOR) & (vols < CAP)), f"T={t}: {vols.min()}..{vols.max()}"
+        for edge in (bundled_surface.k_min, bundled_surface.k_max):
+            lo = float(lv.vol(edge - 1e-4, t))
+            hi = float(lv.vol(edge + 1e-4, t))
+            assert abs(lo - hi) < 1e-3, f"T={t} k={edge}: {lo} vs {hi}"
+            # constant in k beyond k_max - DK (clamped stencil)
+            far = float(lv.vol(edge + math.copysign(1.0, edge), t))
+            assert far == pytest.approx(hi if edge > 0 else lo, abs=1e-15)
+    assert lv.floor_count == 0 and lv.cap_count == 0
+    # Reference point at the wing for T = 1: 0.197 (was 5.0 before the fix).
+    assert float(lv.vol(0.5, 1.0)) == pytest.approx(0.19703445, abs=1e-6)
+
+
+def test_stencil_clamp_only_when_box_wider_than_2dk():
+    """A degenerate box narrower than 2 DK is left unclamped (no crash)."""
+    ks = np.array([-0.0005, 0.0, 0.0005])
+    ts = np.array([0.5, 1.0])
+    srf = ImpliedVolSurface(ks, ts, np.full((2, 3), 0.2))
+    lv = DupireLocalVol(srf)
+    assert float(lv.vol(0.0, 0.75)) == pytest.approx(0.2, abs=1e-6)
+    assert float(lv.vol(3.0, 0.75)) == pytest.approx(0.2, abs=1e-6)
+
+
+def test_term_structure_local_vol_reprices_forward_variance():
+    """Flat-in-k surface with iv = {0.15, 0.20, 0.25} at T = {0.25, 0.5, 1}:
+    local variance is the piecewise-constant forward variance."""
+    ks = np.linspace(-0.5, 0.5, 11)
+    ts = np.array([0.25, 0.5, 1.0])
+    vols = np.array([[0.15] * 11, [0.20] * 11, [0.25] * 11])
+    srf = ImpliedVolSurface(ks, ts, vols)
+    lv = DupireLocalVol(srf)
+    # (0.20^2*0.5 - 0.15^2*0.25) / 0.25 = 0.0575 -> 0.239792
+    assert float(lv.vol(0.0, 0.4)) == pytest.approx(math.sqrt(0.0575), abs=1e-6)
+    assert float(lv.vol(0.3, 0.4)) == pytest.approx(math.sqrt(0.0575), abs=1e-6)
+    # (0.25^2*1 - 0.20^2*0.5) / 0.5 = 0.085 -> 0.291548
+    assert float(lv.vol(0.0, 0.75)) == pytest.approx(math.sqrt(0.085), abs=1e-6)
+    # below the first pillar: flat forward variance = first-pillar vol
+    assert float(lv.vol(0.0, 0.1)) == pytest.approx(0.15, abs=1e-6)
+    # beyond the last pillar: last interval's slope continues
+    assert float(lv.vol(0.0, 2.0)) == pytest.approx(math.sqrt(0.085), abs=1e-6)
+    assert lv.floor_count == 0 and lv.cap_count == 0
+
+
+def test_term_structure_pde_round_trip_within_3bp():
+    """End to end: pillar kinks + t_mid freezing + time interpolation."""
+    from localvol import Market, implied_vol, price_european_pde
+
+    ks = np.linspace(-0.5, 0.5, 11)
+    ts = np.array([0.25, 0.5, 1.0])
+    vols = np.array([[0.15] * 11, [0.20] * 11, [0.25] * 11])
+    srf = ImpliedVolSurface(ks, ts, vols)
+    lv = DupireLocalVol(srf)
+    mkt = Market(100.0, 0.03, 0.01)
+    for t in (0.75, 1.0):
+        iv_in = float(srf.implied_vol(0.0, t))
+        price = price_european_pde(mkt, 100.0, t, lv.vol, num_space=200, num_time=200, sigma_ref=iv_in)
+        iv_out = implied_vol(price, 100.0, 100.0, 0.03, 0.01, t, True)
+        assert abs(iv_out - iv_in) * 1e4 < 3.0, f"T={t}: {(iv_out - iv_in) * 1e4:.2f} bp"
+
+
+def test_t0_equals_short_time_limit(bundled_localvol):
+    """MAJ-1 regression: vol(k, 0) is the Berestycki-Busca-Florent limit
+    sigma_imp / (1 - k sigma_imp'/sigma_imp), continuous with T -> 0+
+    (before the fix vol(-0.3, 0) = 0.309 vs vol(-0.3, 1e-6) = 0.452)."""
+    lv = bundled_localvol
+    srf = lv.surface
+    for k in (-0.3, -0.1, 0.0, 0.2, 0.45):
+        v0 = float(lv.vol(k, 0.0))
+        assert abs(v0 - float(lv.vol(k, 1e-6))) < 1e-3
+        assert abs(v0 - float(lv.vol(k, 1e-4))) < 1e-3
+        # independent BBF evaluation from the short-end implied slice
+        s = float(srf.implied_vol(k, 0.0))
+        sp = (float(srf.implied_vol(k + 1e-3, 0.0)) - float(srf.implied_vol(k - 1e-3, 0.0))) / 2e-3
+        assert v0 == pytest.approx(s / (1.0 - k * sp / s), abs=1e-12)
+    assert float(lv.vol(-0.3, 0.0)) == pytest.approx(0.45240187, abs=1e-6)
+    assert float(lv.vol(0.0, 0.0)) == pytest.approx(0.2, abs=1e-12)  # ATM: s' cancels
+
+
+def test_t0_limit_caps_on_butterfly_violating_slope():
+    """1 - k s'/s <= 0 at T = 0 must cap (and count), never divide by zero."""
+    ks = np.linspace(-0.5, 0.5, 21)
+    # Strongly convex parabola: at |k| = 0.5, k s'/s = 0.5 * 4 / 1.05 = 1.9 > 1.
+    # (A linear or mildly convex smile never violates it: s - k s' is the
+    # tangent's intercept at k = 0, which convexity keeps above s(0).)
+    v = 0.05 + 4.0 * ks * ks
+    srf = ImpliedVolSurface(ks, np.array([0.5, 1.0]), np.vstack([v, v * 1.05]))
+    lv = DupireLocalVol(srf)
+    vols = np.asarray(lv.vol(ks, 0.0))
+    assert np.all(vols <= CAP + 1e-15) and np.all(vols >= FLOOR - 1e-15)
+    assert lv.cap_count > 0
+    assert float(lv.vol(0.5, 0.0)) == CAP
+    assert float(lv.vol(0.0, 0.0)) == pytest.approx(0.05, abs=1e-9)

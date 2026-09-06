@@ -26,6 +26,21 @@ package com.quant.localvol;
  * the remaining {@code N - 1} steps are Crank-Nicolson. Second-order
  * convergence is preserved (verified by the grid-convergence test).
  *
+ * <p><b>Mesh Peclet condition and upwinding</b>: central differencing of
+ * the drift keeps the theta-scheme matrix an M-matrix only while
+ * {@code |mu_i| h <= 2 a_i} at every node. Under a flat vol on the default
+ * grid this holds; under local vol a node floored at 1% by the Dupire clamp
+ * with a few percent of carry violates it. Such nodes (and only those)
+ * switch to first-order upwind for the first derivative:
+ * {@code lower = alpha + max(-mu, 0)/h}, {@code upper = alpha + max(mu, 0)/h},
+ * {@code center = -2 alpha - |mu|/h - r}, keeping both off-diagonals
+ * {@code >= 0} (no spurious oscillations / negative prices) at the cost of
+ * {@code O(|mu| h / 2)} numerical diffusion there.
+ *
+ * <p>A user-supplied {@link LocalVolFn} is checked at every node and time
+ * step: NaN, infinite or negative output throws
+ * {@link IllegalArgumentException}.
+ *
  * <p><b>Grid rule</b> (exact, part of the cross-language contract):
  * {@code x_i = ln S0 + (i - M/2) h} for {@code i = 0..M} with half-width
  * {@code W = |ln(K/S0)| + nsd * sigma_ref * sqrt(T) + |r - q| * T},
@@ -320,8 +335,10 @@ public final class Pde {
         if (!(omega > 0.0 && omega < 2.0)) {
             throw new IllegalArgumentException("omega must lie in (0, 2), got " + omega);
         }
-        if (tol <= 0.0 || maxIter < 1) {
-            throw new IllegalArgumentException("tol must be > 0 and max_iter >= 1");
+        // `!(tol > 0)` also rejects NaN, which `tol <= 0` would let through.
+        if (!(Double.isFinite(tol) && tol > 0.0) || maxIter < 1) {
+            throw new IllegalArgumentException(
+                    "tol must be finite and > 0 and max_iter >= 1, got " + tol + ", " + maxIter);
         }
         if (strike <= 0.0) {
             throw new IllegalArgumentException("American put requires strike > 0");
@@ -329,11 +346,34 @@ public final class Pde {
     }
 
     private static double resolveSigmaRef(LocalVolFn vol, double expiry, double sigmaRef) {
-        double ref = Double.isNaN(sigmaRef) ? vol.vol(0.0, expiry) : sigmaRef;
+        double ref = Double.isNaN(sigmaRef) ? checkedSigma(vol, 0.0, expiry) : sigmaRef;
         if (!Double.isFinite(ref) || ref <= 0.0) {
             throw new IllegalArgumentException("sigma_ref must be finite and > 0, got " + ref);
         }
         return ref;
+    }
+
+    /**
+     * Look up the user function and reject NaN/inf/negative output eagerly:
+     * a bad coefficient would otherwise surface as an opaque Thomas-solver
+     * error or, for a negative sigma, silently enter the scheme squared.
+     */
+    private static double checkedSigma(LocalVolFn vol, double k, double t) {
+        double sig = vol.vol(k, t);
+        if (!Double.isFinite(sig) || sig < 0.0) {
+            throw new IllegalArgumentException(
+                    "vol function returned non-finite/negative sigma at t=" + t + ": " + sig);
+        }
+        return sig;
+    }
+
+    /** Grid spacing {@code h = 2W/M}, computed exactly as the reference does. */
+    private static double gridSpacing(Market market, double strike, double expiry,
+                                      double sigmaRef, int numSpace, double nsd) {
+        double halfWidth = Math.abs(Math.log(strike / market.spot()))
+                + nsd * sigmaRef * Math.sqrt(expiry)
+                + Math.abs(market.rate() - market.dividend()) * expiry;
+        return 2.0 * halfWidth / numSpace;
     }
 
     /**
@@ -343,10 +383,7 @@ public final class Pde {
     private static double[] buildGrid(Market market, double strike, double expiry,
                                       double sigmaRef, int numSpace, double nsd) {
         double x0 = Math.log(market.spot());
-        double halfWidth = Math.abs(Math.log(strike / market.spot()))
-                + nsd * sigmaRef * Math.sqrt(expiry)
-                + Math.abs(market.rate() - market.dividend()) * expiry;
-        double h = 2.0 * halfWidth / numSpace;
+        double h = gridSpacing(market, strike, expiry, sigmaRef, numSpace, nsd);
         double[] x = new double[numSpace + 1];
         for (int i = 0; i <= numSpace; i++) {
             x[i] = x0 + (i - numSpace / 2.0) * h;
@@ -379,17 +416,20 @@ public final class Pde {
         } else {
             double lf = market.logForward(tMid);
             for (int i = 0; i < n; i++) {
-                sigma[i] = fn.vol(x[i + 1] - lf, tMid);
+                sigma[i] = checkedSigma(fn, x[i + 1] - lf, tMid);
             }
         }
         return sigma;
     }
 
     /**
-     * Discrete theta-scheme coefficients for the interior nodes:
+     * Discrete theta-scheme coefficients for the interior nodes. Central
+     * where the mesh Peclet condition {@code |mu| h <= 2a} holds:
      * {@code lower_i = alpha_i - beta_i}, {@code upper_i = alpha_i + beta_i},
      * {@code center_i = -2 alpha_i - r} with {@code alpha = a/h^2},
-     * {@code beta = mu/(2h)}, {@code a = sigma^2/2}, {@code mu = r - q - a}.
+     * {@code beta = mu/(2h)}, {@code a = sigma^2/2}, {@code mu = r - q - a};
+     * first-order upwind elsewhere (see the class docs). Both branches have
+     * row sum {@code -r}.
      */
     private static void coefficients(double[] sigmaNodes, double r, double q, double h,
                                      double[] lower, double[] center, double[] upper) {
@@ -398,10 +438,16 @@ public final class Pde {
             double a = 0.5 * sigmaNodes[i] * sigmaNodes[i];
             double mu = (r - q) - a;
             double alpha = a / (h * h);
-            double beta = mu / (2.0 * h);
-            lower[i] = alpha - beta;
-            upper[i] = alpha + beta;
-            center[i] = -2.0 * alpha - r;
+            if (Math.abs(mu) * h <= 2.0 * a) {
+                double beta = mu / (2.0 * h);
+                lower[i] = alpha - beta;
+                upper[i] = alpha + beta;
+                center[i] = -2.0 * alpha - r;
+            } else {
+                lower[i] = alpha + Math.max(-mu, 0.0) / h;
+                upper[i] = alpha + Math.max(mu, 0.0) / h;
+                center[i] = -2.0 * alpha - Math.abs(mu) / h - r;
+            }
         }
     }
 
@@ -539,7 +585,7 @@ public final class Pde {
         double r = market.rate();
         double q = market.dividend();
         double[] x = buildGrid(market, strike, expiry, sigmaRef, numSpace, nsd);
-        double h = x[1] - x[0];
+        double h = gridSpacing(market, strike, expiry, sigmaRef, numSpace, nsd);
         double[] sNodes = new double[x.length];
         double[] v = new double[x.length];
         for (int i = 0; i < x.length; i++) {
@@ -578,7 +624,7 @@ public final class Pde {
         double r = market.rate();
         double q = market.dividend();
         double[] x = buildGrid(market, strike, expiry, sigmaRef, numSpace, nsd);
-        double h = x[1] - x[0];
+        double h = gridSpacing(market, strike, expiry, sigmaRef, numSpace, nsd);
         double[] obstacle = new double[x.length];
         double[] v = new double[x.length];
         for (int i = 0; i < x.length; i++) {

@@ -42,7 +42,10 @@ Extrapolation
 Calendar arbitrage is checked node-by-node at construction: any
 ``w(k_i, T_{j+1}) < w(k_i, T_j) - 1e-12`` is counted in
 :attr:`ImpliedVolSurface.calendar_violations` and reported via a warning —
-detected and reported, not silently repaired, so callers can decide.
+detected and reported, not silently repaired, so callers can decide.  The
+same policy applies to spline overshoot: every node interval of every pillar
+is probed at 15 interior points and any ``w <= 0`` is counted in
+:attr:`ImpliedVolSurface.negative_w_count` (``implied_vol`` reads 0% there).
 """
 
 from __future__ import annotations
@@ -63,6 +66,7 @@ __all__ = ["CubicSpline1D", "ImpliedVolSurface"]
 FloatOrArray = Union[float, NDArray[np.float64]]
 
 _CAL_TOL = 1e-12
+_NEG_W_SUBDIV = 16  # spline-overshoot scan: probes per node interval (minus one)
 
 
 class CubicSpline1D:
@@ -138,6 +142,9 @@ class ImpliedVolSurface:
     Attributes:
         calendar_violations: number of node pairs where total variance
             decreases with expiry (calendar arbitrage), detected at build time.
+        negative_w_count: number of probe points (15 per node interval, per
+            pillar) where the spline overshoots to ``w <= 0``; detected at
+            build time and reported via a UserWarning, never repaired.
         single_expiry: True when only one pillar was supplied (flat forward
             variance assumed in T; a UserWarning is emitted).
     """
@@ -197,6 +204,24 @@ class ImpliedVolSurface:
 
         self._splines = [CubicSpline1D(k, self.w_nodes[j]) for j in range(t.size)]
 
+        # Spline overshoot detection (report, don't crash): a natural spline
+        # through ragged nodes can dip to w <= 0 between nodes, which
+        # implied_vol() would silently turn into a 0% vol and Dupire into a
+        # 1/w guard.  Scan every interval at _NEG_W_SUBDIV - 1 interior points.
+        self.negative_w_count = 0
+        if k.size > 1:
+            frac = np.arange(1, _NEG_W_SUBDIV) / _NEG_W_SUBDIV
+            probes = (k[:-1, None] + np.diff(k)[:, None] * frac[None, :]).ravel()
+            for sp in self._splines:
+                self.negative_w_count += int(np.count_nonzero(sp(probes) <= 0.0))
+            if self.negative_w_count > 0:
+                warnings.warn(
+                    f"spline overshoot: total variance <= 0 at {self.negative_w_count} "
+                    f"probe point(s) between nodes (implied vol reads as 0% there)",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
     # ------------------------------------------------------------------ I/O
     @classmethod
     def from_csv(cls, path: Union[str, Path]) -> "ImpliedVolSurface":
@@ -207,21 +232,39 @@ class ImpliedVolSurface:
         """
         rows: list[tuple[float, float, float]] = []
         with open(path, newline="") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames is None or {"T", "k", "iv"} - set(reader.fieldnames):
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None or [c.strip() for c in header] != ["T", "k", "iv"]:
                 raise ValueError(f"{path}: CSV must have header columns T,k,iv")
-            for rec in reader:
-                rows.append((float(rec["T"]), float(rec["k"]), float(rec["iv"])))
+            for lineno, rec in enumerate(reader, start=2):
+                if not rec or all(not c.strip() for c in rec):
+                    continue  # blank line
+                if len(rec) != 3:
+                    raise ValueError(
+                        f"{path}: line {lineno}: expected 3 columns (T,k,iv), got {len(rec)}"
+                    )
+                try:
+                    t, k, iv = (float(c.strip()) for c in rec)
+                except ValueError as exc:
+                    raise ValueError(f"{path}: line {lineno}: non-numeric CSV row {rec!r}") from exc
+                if not (math.isfinite(t) and math.isfinite(k) and math.isfinite(iv)):
+                    raise ValueError(f"{path}: line {lineno}: non-finite CSV value {rec!r}")
+                rows.append((t, k, iv))
         if not rows:
             raise ValueError(f"{path}: empty surface CSV")
         ts = np.array(sorted({r[0] for r in rows}))
         ks = np.array(sorted({r[1] for r in rows}))
         vols = np.full((ts.size, ks.size), np.nan)
+        seen = np.zeros((ts.size, ks.size), dtype=bool)
         ti = {t: j for j, t in enumerate(ts)}
         ki = {k: i for i, k in enumerate(ks)}
         for t, k, iv in rows:
-            vols[ti[t], ki[k]] = iv
-        if np.any(np.isnan(vols)):
+            j, i = ti[t], ki[k]
+            if seen[j, i]:
+                raise ValueError(f"{path}: duplicate (T,k) row T={t!r}, k={k!r}")
+            seen[j, i] = True
+            vols[j, i] = iv
+        if not np.all(seen):
             raise ValueError(f"{path}: surface grid is not rectangular (missing (T,k) pairs)")
         return cls(ks, ts, vols)
 

@@ -3,7 +3,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <clocale>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -157,4 +162,92 @@ TEST(Surface, RejectsBadInput) {
     const ImpliedVolSurface srf(k, t, v);
     EXPECT_THROW(srf.total_variance(0.0, -1.0), std::invalid_argument);
     EXPECT_THROW(srf.total_variance(std::nan(""), 1.0), std::invalid_argument);
+}
+
+namespace {
+std::string write_temp_csv(const std::string& name, const std::string& body) {
+    const auto path = std::filesystem::temp_directory_path() / ("localvol_" + name + ".csv");
+    std::ofstream out(path);
+    out << body;
+    return path.string();
+}
+const std::string kBase =
+    "T,k,iv\n0.5,-0.1,0.22\n0.5,0.0,0.2\n0.5,0.1,0.21\n1.0,-0.1,0.23\n1.0,0.0,0.21\n1.0,0.1,0.22\n";
+}  // namespace
+
+TEST(Surface, CsvRejectsDuplicateMissingAndShortRows) {
+    // MIN-4 / MIN-5: duplicates and gaps are named; short/extra/non-numeric
+    // rows are std::invalid_argument, never an index/parse crash.
+    const ImpliedVolSurface good = ImpliedVolSurface::from_csv(write_temp_csv("good", kBase));
+    EXPECT_EQ(good.expiries().size(), 2u);
+    EXPECT_EQ(good.k_nodes().size(), 3u);
+    try {
+        ImpliedVolSurface::from_csv(write_temp_csv("dup", kBase + "1.0,0.0,0.25\n"));
+        FAIL() << "duplicate row accepted";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("duplicate"), std::string::npos);
+    }
+    try {
+        ImpliedVolSurface::from_csv(write_temp_csv("missing", kBase.substr(0, kBase.rfind("1.0,0.1"))));
+        FAIL() << "non-rectangular grid accepted";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("rectangular"), std::string::npos);
+    }
+    EXPECT_THROW(ImpliedVolSurface::from_csv(write_temp_csv("short", "T,k,iv\n0.5,-0.1,0.22\n0.5,0.0\n")),
+                 std::invalid_argument);
+    EXPECT_THROW(ImpliedVolSurface::from_csv(write_temp_csv("extra", "T,k,iv,x\n0.5,-0.1,0.22,1\n")),
+                 std::invalid_argument);
+    EXPECT_THROW(ImpliedVolSurface::from_csv(write_temp_csv("long", "T,k,iv\n0.5,-0.1,0.22,1\n")),
+                 std::invalid_argument);
+    EXPECT_THROW(ImpliedVolSurface::from_csv(write_temp_csv("nonnum", "T,k,iv\n0.5,-0.1,abc\n")),
+                 std::invalid_argument);
+    EXPECT_THROW(ImpliedVolSurface::from_csv(write_temp_csv("nonfinite", "T,k,iv\n0.5,-0.1,nan\n")),
+                 std::invalid_argument);
+    EXPECT_THROW(ImpliedVolSurface::from_csv(write_temp_csv("empty", "T,k,iv\n")), std::invalid_argument);
+    EXPECT_THROW(ImpliedVolSurface::from_csv(write_temp_csv("negiv", "T,k,iv\n0.5,0.0,-0.2\n")),
+                 std::invalid_argument);
+    // Blank lines, spaces and CRLF endings are tolerated.
+    std::string crlf = "T,k,iv\r\n";
+    for (std::size_t p = kBase.find('\n') + 1; p < kBase.size();) {
+        const std::size_t e = kBase.find('\n', p);
+        crlf += " " + kBase.substr(p, e - p) + " \r\n";
+        p = e + 1;
+    }
+    crlf += "\r\n";
+    EXPECT_EQ(ImpliedVolSurface::from_csv(write_temp_csv("crlf", crlf)).k_nodes().size(), 3u);
+}
+
+TEST(Surface, CsvParsingIsLocaleIndependent) {
+    // MIN-3: a comma-decimal process locale must not turn "0.25" into 0.
+    const char* old = std::setlocale(LC_ALL, nullptr);
+    const std::string saved = old ? old : "C";
+    const bool have_locale = std::setlocale(LC_ALL, "de_DE.UTF-8") != nullptr ||
+                             std::setlocale(LC_ALL, "de_DE") != nullptr;
+    const ImpliedVolSurface srf = ImpliedVolSurface::from_csv(kDataDir + "/implied_surface.csv");
+    std::setlocale(LC_ALL, saved.c_str());
+    EXPECT_EQ(srf.expiries().size(), 4u);
+    EXPECT_NEAR(srf.expiries()[0], 0.25, 1e-15);
+    EXPECT_NEAR(srf.k_min(), -0.5, 1e-9);
+    if (!have_locale) {
+        std::cerr << "note: no comma-decimal locale installed; exercised the parser only\n";
+    }
+}
+
+TEST(Surface, NegativeTotalVarianceOvershootIsCounted) {
+    // MIN-15: a ragged slice whose spline dips to w <= 0 between nodes is
+    // reported via negative_w_count(); clean surfaces report 0.
+    const ImpliedVolSurface clean = ImpliedVolSurface::from_csv(kDataDir + "/implied_surface.csv");
+    EXPECT_EQ(clean.negative_w_count(), 0);
+    const std::vector<double> ks = {-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3};
+    const std::vector<double> row = {1.0, 0.001, 0.001, 1.0, 0.001, 0.001, 1.0};
+    const ImpliedVolSurface ragged(ks, {0.5, 1.0}, {row, row});
+    EXPECT_GT(ragged.negative_w_count(), 0);
+    double min_w = 1.0, min_iv = 1.0;
+    for (int i = 0; i <= 600; ++i) {
+        const double k = -0.3 + 0.001 * i;
+        min_w = std::min(min_w, ragged.total_variance(k, 1.0));
+        min_iv = std::min(min_iv, ragged.implied_vol(k, 1.0));
+    }
+    EXPECT_LT(min_w, 0.0);
+    EXPECT_DOUBLE_EQ(min_iv, 0.0);  // reads 0% there rather than throwing
 }

@@ -49,8 +49,8 @@ fn run() -> Result<()> {
     println!();
     let mut max_err_bp = 0.0_f64;
     let mut max_at = (0.0_f64, 0.0_f64);
+    lv.reset_counters(); // once: the clamp report below covers the whole sweep
     for t in expiries {
-        lv.reset_counters();
         print!("  {t:<5.2}");
         let sigma_ref = lv.surface().implied_vol(0.0, t)?;
         for strike in strikes {

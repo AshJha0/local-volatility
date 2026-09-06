@@ -13,4 +13,5 @@ java -cp "out:${JUNIT}:${HAMCREST}" org.junit.runner.JUnitCore \
   com.quant.localvol.DupireTest \
   com.quant.localvol.PdeTest \
   com.quant.localvol.McTest \
+  com.quant.localvol.RoundTripTest \
   com.quant.localvol.GoldenTest

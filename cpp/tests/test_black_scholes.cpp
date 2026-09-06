@@ -4,9 +4,11 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include "localvol/black_scholes.hpp"
+#include "localvol/market.hpp"
 
 using localvol::bs_delta;
 using localvol::bs_gamma;
@@ -117,4 +119,34 @@ TEST(BlackScholes, RejectsInvalidInputs) {
     EXPECT_THROW(bs_price(100, 100, nan, 0.0, 0.2, 1.0), std::invalid_argument);
     EXPECT_THROW(bs_gamma(100, 100, 0.0, 0.0, 0.0, 1.0), std::invalid_argument);
     EXPECT_THROW(bs_vega(100, 100, 0.0, 0.0, 0.2, 0.0), std::invalid_argument);
+}
+
+TEST(BlackScholes, ImpliedVolRejectsBadBracketAndIterations) {
+    // MIN-7: non-default lo/hi/iterations are validated.
+    const double price = localvol::bs_price(100, 100, 0.02, 0.01, 0.2, 1.0, true);
+    EXPECT_THROW(localvol::implied_vol(price, 100, 100, 0.02, 0.01, 1.0, true, 5.0, 1e-9),
+                 std::invalid_argument);
+    EXPECT_THROW(localvol::implied_vol(price, 100, 100, 0.02, 0.01, 1.0, true, 0.0, 1.0),
+                 std::invalid_argument);
+    EXPECT_THROW(localvol::implied_vol(price, 100, 100, 0.02, 0.01, 1.0, true, 1e-9,
+                                       std::numeric_limits<double>::infinity()),
+                 std::invalid_argument);
+    EXPECT_THROW(localvol::implied_vol(price, 100, 100, 0.02, 0.01, 1.0, true, 1e-9, 5.0, 0),
+                 std::invalid_argument);
+    EXPECT_THROW(localvol::implied_vol(std::nan(""), 100, 100, 0.02, 0.01, 1.0, true),
+                 std::invalid_argument);
+    EXPECT_NEAR(localvol::implied_vol(price, 100, 100, 0.02, 0.01, 1.0, true), 0.2, 1e-10);
+}
+
+TEST(BlackScholes, MarketLogForwardValidationAndValue) {
+    // MIN-6: log_forward validates expiry in every port.
+    const localvol::Market mkt(100.0, 0.03, 0.01);
+    EXPECT_NEAR(mkt.log_forward(2.0), std::log(100.0) + 0.02 * 2.0, 1e-15);
+    EXPECT_DOUBLE_EQ(mkt.log_forward(0.0), std::log(100.0));
+    EXPECT_THROW(mkt.log_forward(-1.0), std::invalid_argument);
+    EXPECT_THROW(mkt.log_forward(std::nan("")), std::invalid_argument);
+    EXPECT_THROW(mkt.forward(std::numeric_limits<double>::infinity()), std::invalid_argument);
+    EXPECT_THROW(localvol::Market(100.0, std::nan(""), 0.0), std::invalid_argument);
+    EXPECT_THROW(localvol::Market(100.0, 0.0, std::numeric_limits<double>::infinity()),
+                 std::invalid_argument);
 }

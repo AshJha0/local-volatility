@@ -26,7 +26,11 @@
 //! Calendar arbitrage is checked node-by-node at construction: any
 //! `w(k_i, T_{j+1}) < w(k_i, T_j) - 1e-12` is counted in
 //! [`ImpliedVolSurface::calendar_violations`] and reported via a log line —
-//! detected and reported, not silently repaired.
+//! detected and reported, not silently repaired.  The same policy applies to
+//! spline overshoot: every node interval of every pillar is probed at 15
+//! interior points and any `w <= 0` is counted in
+//! [`ImpliedVolSurface::negative_w_count`] (`implied_vol` reads 0% there).
+//! The surface is immutable after construction and `Send + Sync`.
 
 use std::path::Path;
 
@@ -34,6 +38,8 @@ use crate::error::{invalid, LocalVolError, Result};
 use crate::tridiag::thomas_solve;
 
 const CAL_TOL: f64 = 1e-12;
+/// Spline-overshoot scan: probes per node interval (minus one).
+const NEG_W_SUBDIV: usize = 16;
 
 /// Natural cubic spline through `(x_i, y_i)`.
 ///
@@ -130,6 +136,7 @@ pub struct ImpliedVolSurface {
     w_nodes: Vec<Vec<f64>>,
     splines: Vec<CubicSpline1D>,
     calendar_violations: usize,
+    negative_w_count: usize,
     single_expiry: bool,
 }
 
@@ -203,6 +210,27 @@ impl ImpliedVolSurface {
             .map(|row| CubicSpline1D::new(k_nodes, row))
             .collect::<Result<Vec<_>>>()?;
 
+        // Spline-overshoot detection (report, don't fail): probe every node
+        // interval of every pillar at NEG_W_SUBDIV - 1 interior points and
+        // count w <= 0 (implied_vol would silently read 0% there).
+        let mut negative_w_count = 0usize;
+        for sp in &splines {
+            for pair in k_nodes.windows(2) {
+                let h = pair[1] - pair[0];
+                for p in 1..NEG_W_SUBDIV {
+                    if sp.eval_clamped(pair[0] + h * (p as f64 / NEG_W_SUBDIV as f64)) <= 0.0 {
+                        negative_w_count += 1;
+                    }
+                }
+            }
+        }
+        if negative_w_count > 0 {
+            eprintln!(
+                "warning: spline overshoot: total variance <= 0 at {negative_w_count} probe \
+                 point(s) between nodes (implied vol reads as 0% there)"
+            );
+        }
+
         Ok(ImpliedVolSurface {
             k_nodes: k_nodes.to_vec(),
             expiries: expiries.to_vec(),
@@ -210,13 +238,15 @@ impl ImpliedVolSurface {
             w_nodes,
             splines,
             calendar_violations,
+            negative_w_count,
             single_expiry,
         })
     }
 
-    /// Load from a CSV with header `T,k,iv` (one row per grid node).
-    /// The file must contain a full rectangular grid: every `(T, k)` pair
-    /// exactly once (row order irrelevant).
+    /// Load from a CSV with header exactly `T,k,iv` (one row per grid node,
+    /// three columns).  The file must contain a full rectangular grid: every
+    /// `(T, k)` pair exactly once (row order irrelevant); duplicates, gaps,
+    /// short/long/non-numeric/non-finite rows are `InvalidInput` errors.
     pub fn from_csv<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)
@@ -255,11 +285,19 @@ impl ImpliedVolSurface {
                     ))
                 })
             };
-            rows.push((
+            let row = (
                 parse(parts[0], "T")?,
                 parse(parts[1], "k")?,
                 parse(parts[2], "iv")?,
-            ));
+            );
+            if !(row.0.is_finite() && row.1.is_finite() && row.2.is_finite()) {
+                return Err(invalid(format!(
+                    "{}: line {}: non-finite CSV value",
+                    path.display(),
+                    ln + 2
+                )));
+            }
+            rows.push(row);
         }
         if rows.is_empty() {
             return Err(invalid(format!("{}: empty surface CSV", path.display())));
@@ -273,12 +311,20 @@ impl ImpliedVolSurface {
         sort_dedup(&mut ts);
         sort_dedup(&mut ks);
         let mut vols = vec![vec![f64::NAN; ks.len()]; ts.len()];
+        let mut seen = vec![vec![false; ks.len()]; ts.len()];
         for (t, k, iv) in rows {
             let j = ts.partition_point(|&v| v < t);
             let i = ks.partition_point(|&v| v < k);
+            if seen[j][i] {
+                return Err(invalid(format!(
+                    "{}: duplicate (T,k) row T={t}, k={k}",
+                    path.display()
+                )));
+            }
+            seen[j][i] = true;
             vols[j][i] = iv;
         }
-        if vols.iter().flatten().any(|v| v.is_nan()) {
+        if seen.iter().flatten().any(|&s| !s) {
             return Err(invalid(format!(
                 "{}: surface grid is not rectangular (missing (T,k) pairs)",
                 path.display()
@@ -328,13 +374,21 @@ impl ImpliedVolSurface {
         if !expiry.is_finite() || expiry < 0.0 {
             return Err(invalid(format!("expiry must be finite and >= 0, got {expiry}")));
         }
+        if !k.is_finite() {
+            return Err(invalid("k must be finite"));
+        }
+        Ok(self.implied_vol_unchecked(k, expiry))
+    }
+
+    /// Hot-path variant: `k` finite and `expiry >= 0` already guaranteed.
+    pub(crate) fn implied_vol_unchecked(&self, k: f64, expiry: f64) -> f64 {
         if expiry == 0.0 {
             let t0 = self.expiries[0];
-            let w1 = self.total_variance(k, t0)?;
-            return Ok((w1 / t0).sqrt());
+            let w1 = self.total_variance_unchecked(k, t0);
+            return (w1 / t0).sqrt();
         }
-        let w = self.total_variance(k, expiry)?;
-        Ok((w.max(0.0) / expiry).sqrt())
+        let w = self.total_variance_unchecked(k, expiry);
+        (w.max(0.0) / expiry).sqrt()
     }
 
     /// Node grid in `k` (strictly increasing).
@@ -361,6 +415,14 @@ impl ImpliedVolSurface {
     /// (calendar arbitrage), detected at build time.
     pub fn calendar_violations(&self) -> usize {
         self.calendar_violations
+    }
+
+    /// Number of probe points (15 per node interval, per pillar) where the
+    /// natural spline overshoots to total variance `<= 0` (`implied_vol`
+    /// reads 0% there).  Detected at construction and logged, never
+    /// repaired; 0 for a well-behaved surface.
+    pub fn negative_w_count(&self) -> usize {
+        self.negative_w_count
     }
 
     /// True when only one pillar was supplied (flat forward variance in T).

@@ -158,6 +158,11 @@ def implied_vol(
     golden values — is trivially reproducible in C++/Rust/Java: 100 halvings
     of a fixed bracket give ~1e-10 vol accuracy deterministically.
 
+    ``lo``, ``hi`` and ``iterations`` default to the cross-language golden
+    contract (``[1e-9, 5.0]``, 100 halvings); non-default values are
+    validated (``0 < lo < hi`` finite, ``iterations >= 1``) but leave that
+    contract.
+
     Raises ValueError if the price violates the static no-arbitrage bounds for
     the given forward, or if inputs are non-finite / negative where forbidden.
     """
@@ -168,6 +173,10 @@ def implied_vol(
         raise ValueError("implied_vol requires expiry > 0")
     if strike <= 0.0:
         raise ValueError("implied_vol requires strike > 0")
+    if not (math.isfinite(lo) and math.isfinite(hi) and 0.0 < lo < hi):
+        raise ValueError(f"bracket must satisfy 0 < lo < hi, got lo={lo!r}, hi={hi!r}")
+    if iterations < 1:
+        raise ValueError(f"iterations must be >= 1, got {iterations!r}")
     lower = bs_price(spot, strike, rate, dividend, 0.0, expiry, is_call)
     upper = spot * math.exp(-dividend * expiry) if is_call else strike * math.exp(-rate * expiry)
     eps = 1e-12 * max(1.0, spot)

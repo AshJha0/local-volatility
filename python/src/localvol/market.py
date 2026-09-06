@@ -56,5 +56,8 @@ class Market:
         return self.spot * math.exp((self.rate - self.dividend) * expiry)
 
     def log_forward(self, expiry: float) -> float:
-        """``ln F(T)`` — convenient for log-moneyness lookups."""
+        """``ln F(T)`` — convenient for log-moneyness lookups.  Requires
+        ``expiry >= 0`` (validated, like :meth:`forward`, in every port)."""
+        if not math.isfinite(expiry) or expiry < 0.0:
+            raise ValueError(f"expiry must be finite and >= 0, got {expiry!r}")
         return math.log(self.spot) + (self.rate - self.dividend) * expiry

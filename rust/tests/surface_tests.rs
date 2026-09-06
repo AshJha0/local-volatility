@@ -165,3 +165,69 @@ fn from_csv_round_trip() {
     assert!(err.to_string().contains("header"), "{err}");
     assert!(ImpliedVolSurface::from_csv(data_dir().join("missing.csv")).is_err());
 }
+
+fn write_temp_csv(name: &str, body: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("localvol_rs_{name}.csv"));
+    std::fs::write(&path, body).expect("temp csv");
+    path
+}
+
+const BASE_CSV: &str =
+    "T,k,iv\n0.5,-0.1,0.22\n0.5,0.0,0.2\n0.5,0.1,0.21\n1.0,-0.1,0.23\n1.0,0.0,0.21\n1.0,0.1,0.22\n";
+
+#[test]
+fn csv_rejects_duplicate_missing_and_short_rows() {
+    // MIN-4 / MIN-5: duplicates and gaps are named; short/extra/non-numeric
+    // rows are InvalidInput errors, never a panic.
+    let good = ImpliedVolSurface::from_csv(write_temp_csv("good", BASE_CSV)).unwrap();
+    assert_eq!(good.expiries(), &[0.5, 1.0]);
+    assert_eq!(good.k_nodes().len(), 3);
+
+    let dup = format!("{BASE_CSV}1.0,0.0,0.25\n");
+    let err = ImpliedVolSurface::from_csv(write_temp_csv("dup", &dup)).unwrap_err();
+    assert!(err.to_string().contains("duplicate"), "{err}");
+
+    let missing = &BASE_CSV[..BASE_CSV.rfind("1.0,0.1").unwrap()];
+    let err = ImpliedVolSurface::from_csv(write_temp_csv("missing", missing)).unwrap_err();
+    assert!(err.to_string().contains("rectangular"), "{err}");
+
+    for (name, body) in [
+        ("short", "T,k,iv\n0.5,-0.1,0.22\n0.5,0.0\n"),
+        ("extra", "T,k,iv,x\n0.5,-0.1,0.22,1\n"),
+        ("long", "T,k,iv\n0.5,-0.1,0.22,1\n"),
+        ("nonnum", "T,k,iv\n0.5,-0.1,abc\n"),
+        ("nonfinite", "T,k,iv\n0.5,-0.1,NaN\n"),
+        ("empty", "T,k,iv\n"),
+        ("negiv", "T,k,iv\n0.5,0.0,-0.2\n"),
+    ] {
+        let res = ImpliedVolSurface::from_csv(write_temp_csv(name, body));
+        assert!(res.is_err(), "{name} accepted");
+    }
+    // Blank lines, spaces and CRLF endings are tolerated.
+    let mut crlf = String::from("T,k,iv\r\n");
+    for line in BASE_CSV.lines().skip(1) {
+        crlf.push_str(&format!(" {line} \r\n"));
+    }
+    crlf.push_str("\r\n");
+    assert_eq!(ImpliedVolSurface::from_csv(write_temp_csv("crlf", &crlf)).unwrap().k_nodes().len(), 3);
+}
+
+#[test]
+fn negative_total_variance_overshoot_is_counted() {
+    // MIN-15: a ragged slice whose spline dips to w <= 0 between nodes is
+    // reported via negative_w_count(); clean surfaces report 0.
+    assert_eq!(bundled_surface().negative_w_count(), 0);
+    let ks = [-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3];
+    let row = vec![1.0, 0.001, 0.001, 1.0, 0.001, 0.001, 1.0];
+    let ragged = ImpliedVolSurface::new(&ks, &[0.5, 1.0], &[row.clone(), row]).unwrap();
+    assert!(ragged.negative_w_count() > 0);
+    let mut min_w = 1.0_f64;
+    let mut min_iv = 1.0_f64;
+    for i in 0..=600 {
+        let k = -0.3 + 0.001 * i as f64;
+        min_w = min_w.min(ragged.total_variance(k, 1.0).unwrap());
+        min_iv = min_iv.min(ragged.implied_vol(k, 1.0).unwrap());
+    }
+    assert!(min_w < 0.0);
+    assert_eq!(min_iv, 0.0); // reads 0% there rather than failing
+}

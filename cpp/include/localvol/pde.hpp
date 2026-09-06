@@ -21,6 +21,14 @@
 /// precisely those modes; second-order accuracy is preserved (observed
 /// convergence order ~ 2 on grid halving, tested in [1.5, 2.5]).
 ///
+/// Mesh Peclet condition: central differencing of the drift keeps the
+/// theta-scheme matrix an M-matrix only while |mu_i| h <= 2 a_i. Under a
+/// flat vol on the default grid this holds; under local vol a node floored
+/// at 1% with a few percent of carry violates it. Such nodes (and only
+/// those) switch to first-order upwind for the first derivative, keeping
+/// both off-diagonals >= 0 (no spurious oscillations / negative prices)
+/// at the cost of O(|mu| h / 2) numerical diffusion there.
+///
 /// Grid rule (exact, ports must copy): with M = num_space even,
 ///   W = |ln(K/S0)| + nsd * sigma_ref * sqrt(T) + |r - q| * T,  h = 2W/M,
 ///   x_i = ln S0 + (i - M/2) h, i = 0..M
@@ -73,7 +81,9 @@ double price_european_pde(const Market& market, double strike, double expiry,
                           double sigma, bool is_call = true,
                           const PdeSettings& settings = PdeSettings{});
 
-/// European vanilla under a local-volatility function.
+/// European vanilla under a local-volatility function. The callable's
+/// output is checked at every node and time step: NaN, inf or a negative
+/// sigma throws std::invalid_argument.
 /// \param sigma_ref reference vol for the grid width; defaults to
 ///        vol(0, T) — the ATM local vol at expiry. Must be finite and > 0.
 double price_european_pde(const Market& market, double strike, double expiry,

@@ -65,9 +65,12 @@ impl Market {
         Ok(self.spot * ((self.rate - self.dividend) * expiry).exp())
     }
 
-    /// `ln F(T)` — convenient for log-moneyness lookups (no validation:
-    /// used on times generated internally by the pricers).
-    pub fn log_forward(&self, expiry: f64) -> f64 {
-        self.spot.ln() + (self.rate - self.dividend) * expiry
+    /// `ln F(T)` — convenient for log-moneyness lookups.  Requires
+    /// `expiry >= 0` (validated, like [`Market::forward`], in every port).
+    pub fn log_forward(&self, expiry: f64) -> Result<f64> {
+        if !expiry.is_finite() || expiry < 0.0 {
+            return Err(invalid(format!("expiry must be finite and >= 0, got {expiry}")));
+        }
+        Ok(self.spot.ln() + (self.rate - self.dividend) * expiry)
     }
 }

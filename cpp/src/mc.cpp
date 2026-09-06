@@ -1,8 +1,10 @@
 #include "localvol/mc.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace localvol {
@@ -16,9 +18,18 @@ void validate_mc(const Market& /*market*/, double strike, double expiry, const M
     if (!std::isfinite(expiry) || expiry <= 0.0) {
         throw std::invalid_argument("mc: expiry must be finite and > 0");
     }
-    if (s.n_paths < 2) throw std::invalid_argument("mc: n_paths must be >= 2");
-    if (s.antithetic && s.n_paths % 2 != 0) {
-        throw std::invalid_argument("mc: antithetic sampling requires an even n_paths");
+    if (s.antithetic) {
+        if (s.n_paths % 2 != 0) {
+            throw std::invalid_argument("mc: antithetic sampling requires an even n_paths");
+        }
+        if (s.n_paths < 4) {
+            throw std::invalid_argument(
+                "mc: n_paths must be >= 4 with antithetic sampling (at least two pair means "
+                "are needed for a standard error)");
+        }
+    } else if (s.n_paths < 2) {
+        throw std::invalid_argument(
+            "mc: n_paths must be >= 2 (at least two samples are needed for a standard error)");
     }
     if (s.n_steps < 1) throw std::invalid_argument("mc: n_steps must be >= 1");
 }
@@ -28,6 +39,17 @@ VolFn flat_vol_fn(double sigma) {
         throw std::invalid_argument("mc: flat vol must be finite and > 0");
     }
     return [sigma](double /*k*/, double /*t*/) { return sigma; };
+}
+
+/// Look up the user callable and reject NaN/inf/negative output eagerly
+/// (it would otherwise propagate silently into price and std_err).
+double checked_sigma(const VolFn& vol, double k, double t) {
+    const double sig = vol(k, t);
+    if (!std::isfinite(sig) || sig < 0.0) {
+        throw std::invalid_argument("mc: vol callable returned non-finite/negative sigma at t=" +
+                                    std::to_string(t));
+    }
+    return sig;
 }
 
 /// Mean / standard error over samples; with antithetic on, the samples are
@@ -77,10 +99,10 @@ McResult european_mc(const Market& market, double strike, double expiry, const V
             const double z = normal(rng);
             // Start-of-step lookup at forward log-moneyness X_n - ln F(t_n);
             // the mirrored path recomputes sigma from its own state.
-            const double sig = vol(x - lf, t);
+            const double sig = checked_sigma(vol, x - lf, t);
             x += drift_rq - 0.5 * sig * sig * dt + sig * sq * z;
             if (s.antithetic) {
-                const double siga = vol(xa - lf, t);
+                const double siga = checked_sigma(vol, xa - lf, t);
                 xa += drift_rq - 0.5 * siga * siga * dt - siga * sq * z;
             }
         }
@@ -119,19 +141,20 @@ McResult barrier_mc(const Market& market, double strike, double barrier, double 
             const double lf = market.log_forward(t);
             const double z = normal(rng);
             {
-                const double sig = vol(x - lf, t);
+                const double sig = checked_sigma(vol, x - lf, t);
                 const double x_new = x + drift_rq - 0.5 * sig * sig * dt + sig * sq * z;
                 if (x_new >= b) {
                     w = 0.0;  // discrete knock-out
                 } else if (brownian_bridge && w > 0.0) {
-                    // Exact bridge crossing probability for x, x_new < b.
+                    // Exact bridge crossing probability for x, x_new < b
+                    // (sig == 0 gives exp(-inf) = 0: no crossing possible).
                     const double pc = std::exp(-2.0 * (b - x) * (b - x_new) / (sig * sig * dt));
                     w *= 1.0 - pc;
                 }
                 x = x_new;
             }
             if (s.antithetic) {
-                const double sig = vol(xa - lf, t);
+                const double sig = checked_sigma(vol, xa - lf, t);
                 const double x_new = xa + drift_rq - 0.5 * sig * sig * dt - sig * sq * z;
                 if (x_new >= b) {
                     wa = 0.0;
